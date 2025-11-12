@@ -144,9 +144,9 @@ class DaliHevcDataset(torch.utils.data.IterableDataset):
       pipe.feed_input("inbuf", [mv])
       it = DALIGenericIterator([pipe], output_map=["video"], size=pipe_size, auto_reset=False, last_batch_policy=LastBatchPolicy.PARTIAL, last_batch_padded=False, prepare_first_batch=False)
 
-      for data in it:
+      for idx, data in enumerate(it):
         vid = data[0]["video"]
-        yield vid
+        yield path, idx, vid
 
       torch.cuda.synchronize()
       it.reset()
@@ -163,6 +163,6 @@ if __name__ == "__main__":
   uncompressed_data_dir = Path('./deflated_test_videos/')
   ds = DaliHevcDataset(files, archive_path=uncompressed_archive_path, data_dir=uncompressed_data_dir, batch_size=batch_size, device_id=device_id)
   ds.prepare_data()
-  for i, batch in enumerate(ds):
+  for i, (path, idx, batch) in enumerate(ds):
     assert batch.shape == (batch_size, seq_len, camera_size[1], camera_size[0], 3), f"unexpected batch shape: {batch.shape}"
     print(i, batch.shape)

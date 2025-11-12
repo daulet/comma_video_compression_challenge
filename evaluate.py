@@ -10,6 +10,7 @@ batch_size = 32
 num_threads = 2
 seed = 123
 prefetch_queue_depth = 4
+num = 1 # TODO argparse
 
 compressed_archive_path = Path('./comma2k19_submission.zip')
 compressed_data_dir = Path('./deflated_comma2k19_submission/')
@@ -33,7 +34,7 @@ def main():
   distortion_net.load_state_dicts(posenet_sd_path, segnet_sd_path, device)
 
   with open("test_video_names.txt", "r") as file:
-    test_video_names = [line.strip() for line in file.readlines()]
+    test_video_names = [line.strip() for line in file.readlines()][:num]
 
   ds_gt = DaliHevcDataset(test_video_names, archive_path=uncompressed_archive_path, data_dir=uncompressed_data_dir, batch_size=batch_size, device_id=local_rank, num_threads=num_threads, seed=seed, prefetch_queue_depth=prefetch_queue_depth)
   ds_gt.prepare_data()
@@ -45,12 +46,13 @@ def main():
   dl_comp = torch.utils.data.DataLoader(ds_comp, batch_size=None, num_workers=0)
   # end replace
 
+  rate = sum([(compressed_data_dir / file).stat().st_size for file in test_video_names]) / sum([(uncompressed_data_dir / file).stat().st_size for file in test_video_names])
   dl = zip(dl_gt, dl_comp)
   posenet_dists = torch.zeros([], device=device)
   segnet_dists = torch.zeros([], device=device)
   steps = 0
   with torch.inference_mode():
-    for batch_gt, batch_comp in tqdm(dl):
+    for (_,_,batch_gt), (_,_,batch_comp) in tqdm(dl):
       steps += 1
       assert batch_gt.shape == (batch_size, seq_len, camera_size[1], camera_size[0], 3), f"unexpected batch shape: {batch_gt.shape}"
       assert batch_comp.shape == (batch_size, seq_len, camera_size[1], camera_size[0], 3), f"unexpected batch shape: {batch_comp.shape}"
@@ -64,14 +66,13 @@ def main():
 
     posenet_dist = (posenet_dists / steps).item()
     segnet_dist = (segnet_dists / steps).item()
-    rate = compressed_archive_path.stat().st_size / uncompressed_archive_path.stat().st_size
     score = 100 * segnet_dist +  math.sqrt(posenet_dist * 10)  + 25 * rate
 
     if rank == 0:
       print(f"Results over {steps*world_size*batch_size} samples")
       print(f"Average PoseNet Distortion: {posenet_dist:.8f}")
       print(f"Average SegNet Distortion: {segnet_dist:.8f}")
-      print(f"Compression Rate: {rate:.8f}")
+      print(f"Compression Rate (from deflated data): {rate:.8f}")
       print(f"Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = {score:.8f}")
 
   # Cleanup

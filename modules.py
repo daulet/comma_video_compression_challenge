@@ -161,7 +161,7 @@ if __name__ == "__main__":
   posenet_sd = load_file(posenet_sd_path, device=str(device))
   posenet.load_state_dict(posenet_sd)
 
-  for batch in ds:
+  for (_,_,batch) in ds:
     assert batch.shape == (batch_size, seq_len, camera_size[1], camera_size[0], 3), f"unexpected batch shape: {batch.shape}"
     batch = einops.rearrange(batch, 'b t h w c -> b t c h w', b=batch_size, t=seq_len, c=3).float()
     segnet.debug_run(batch)

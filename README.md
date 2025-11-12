@@ -77,7 +77,11 @@ class YourSubmissionDataset(torch.utils.data.IterableDataset):
 
   def __iter__(self):
     for file_name in self.file_names:
-      # yield torch.Tensor with shape (batch_size, seq_len, camera_size[1], camera_size[0], 3), dtype=uint8
+      # yield name, idx, batch
+
+      # name: segment_id
+      # idx: batch index within the segment
+      # batch: torch.Tensor with shape (batch_size, seq_len, camera_size[1], camera_size[0], 3), dtype=uint8
       ...
 
 ```
