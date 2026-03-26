@@ -1,5 +1,5 @@
 {
   "name": "comma-video-compression-challenge",
   "image": "mcr.microsoft.com/devcontainers/python:3",
-  "postCreateCommand": "curl -LsSf https://astral.sh/uv/install.sh | sh"
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y git-lfs ffmpeg && curl -LsSf https://astral.sh/uv/install.sh | sh"
 }
