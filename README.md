@@ -1,4 +1,4 @@
-# comma Video compression challenge
+# comma video compression challenge
 
  `./videos/0.mkv` is a 1 minute 35.8 MB dashcam video. Make it as small as possible while preserving semantic content and temporal dynamics.
 
