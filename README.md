@@ -93,6 +93,22 @@ If everything worked as expected, this should producce a `report.txt` file with 
   Final score: 100*segnet_dist + √(10*posenet_dist) + 25*rate = 4.39
 ```
 
+## autoresearch mode
+
+This repo also includes an autoresearch loop setup:
+
+- `compress.py` — the single file to edit for experiments.
+- `eval.py` — fixed evaluator that runs `compress.py`, inflates outputs, and computes score.
+- `program.md` — loop instructions (branching, logging, commit policy).
+- `results.tsv` — persistent experiment log (tracked in git).
+
+Run one experiment with:
+
+```bash
+./.venv/bin/python eval.py > run.log 2>&1
+grep -E '^score:|^segnet_dist:|^posenet_dist:|^rate:|^archive_bytes:' run.log
+```
+
 ## submission format and rules
 
 A submission is a Pull Request to this repo that includes:

@@ -227,3 +227,6 @@ archive/
 inflated/
 report.txt
 
+# Autoresearch artifacts
+run.log
+autoresearch_work/
