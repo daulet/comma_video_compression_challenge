@@ -24,40 +24,14 @@ LINEAR_REFINER_FEATURES = 13
 LINEAR_REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
 LINEAR_REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
-MLP_REFINER_FEATURES = 16
+MLP_REFINER_FEATURES = 19
 MLP_REFINER_HIDDEN = 4
 MLP_REFINER_SAMPLE_STRIDE = 32
 MLP_REFINER_MAX_SAMPLES = 200_000
-MLP_REFINER_STEPS = 128
+MLP_REFINER_STEPS = 192
 MLP_REFINER_BATCH_SIZE = 8192
 MLP_REFINER_LR = 3e-2
 MLP_REFINER_RESIDUAL_CLAMP = 10.0 / 255.0
-MLP_INIT_W1 = [
-  [-0.05078125, -0.0341796875, -0.006595611572265625, -0.01413726806640625],
-  [0.043212890625, 0.0772705078125, -0.0184478759765625, -0.088623046875],
-  [0.00907135009765625, -0.01983642578125, 0.0024166107177734375, 0.037017822265625],
-  [-0.10430908203125, -0.0701904296875, -0.0269775390625, -0.048004150390625],
-  [-0.099853515625, 0.0287322998046875, 0.09033203125, 0.0594482421875],
-  [-0.0181427001953125, 0.03912353515625, 0.037017822265625, 0.10394287109375],
-  [0.03253173828125, -0.024566650390625, -0.032562255859375, -0.0311279296875],
-  [0.05718994140625, 0.091064453125, 0.010284423828125, -0.0733642578125],
-  [-0.02752685546875, -0.0072479248046875, -0.0267791748046875, -0.042388916015625],
-  [0.047332763671875, -0.1612548828125, -0.07086181640625, 0.051788330078125],
-  [0.09564208984375, 0.1793212890625, 0.06500244140625, 0.058441162109375],
-  [0.09320068359375, -0.053741455078125, -0.1165771484375, -0.0460205078125],
-  [0.041748046875, 1.349609375, -0.056396484375, 0.67236328125],
-  [0.045623779296875, -1.5673828125, 0.2034912109375, -0.7255859375],
-  [-0.046539306640625, -0.002361297607421875, 0.37890625, -0.046722412109375],
-  [-0.06695556640625, -0.047821044921875, 0.00921630859375, -0.0160675048828125],
-]
-MLP_INIT_B1 = [0.00962066650390625, 0.013885498046875, -0.081787109375, 0.01151275634765625]
-MLP_INIT_W2 = [
-  [-0.0234832763671875, -0.006908416748046875, 0.057464599609375],
-  [0.07470703125, 0.01273345947265625, 0.009918212890625],
-  [-0.038970947265625, -0.030731201171875, 0.07421875],
-  [0.018829345703125, 0.0258026123046875, -0.0037899017333984375],
-]
-MLP_INIT_B2 = [-0.00275421142578125, -0.0018014907836914062, 0.00930023193359375]
 
 
 @dataclass(frozen=True)
@@ -121,12 +95,14 @@ def _mlp_refiner_features(
   prev_base: torch.Tensor,
   prev_prev_base: torch.Tensor,
   linear_residual: torch.Tensor,
+  prev_linear_residual: torch.Tensor,
 ) -> torch.Tensor:
   delta = base - prev_base
   prev_delta = prev_base - prev_prev_base
   linear = linear_residual.permute(2, 0, 1).unsqueeze(0)
+  prev_linear = prev_linear_residual.permute(2, 0, 1).unsqueeze(0)
   bias = torch.ones((1, 1, base.shape[2], base.shape[3]), dtype=base.dtype, device=base.device)
-  return torch.cat([base, delta, delta.abs(), prev_delta, linear, bias], dim=1)
+  return torch.cat([base, delta, delta.abs(), prev_delta, linear, prev_linear, bias], dim=1)
 
 
 def _refiner_path(dst_video: Path) -> Path:
@@ -151,6 +127,10 @@ def _refine_frame(base: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
   return refined.permute(2, 0, 1).unsqueeze(0)
 
 
+def _zero_residual_like(base: torch.Tensor) -> torch.Tensor:
+  return torch.zeros((base.shape[2], base.shape[3], 3), dtype=base.dtype, device=base.device)
+
+
 def _fit_mlp_temporal_refiner(features: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, ...]:
   if features.shape[0] > MLP_REFINER_MAX_SAMPLES:
     generator = torch.Generator().manual_seed(0)
@@ -159,10 +139,10 @@ def _fit_mlp_temporal_refiner(features: torch.Tensor, targets: torch.Tensor) -> 
     targets = targets[keep]
 
   generator = torch.Generator().manual_seed(0)
-  w1 = torch.tensor(MLP_INIT_W1, dtype=torch.float32, requires_grad=True)
-  b1 = torch.tensor(MLP_INIT_B1, dtype=torch.float32, requires_grad=True)
-  w2 = torch.tensor(MLP_INIT_W2, dtype=torch.float32, requires_grad=True)
-  b2 = torch.tensor(MLP_INIT_B2, dtype=torch.float32, requires_grad=True)
+  w1 = (torch.randn((MLP_REFINER_FEATURES, MLP_REFINER_HIDDEN), generator=generator) * 0.05).requires_grad_()
+  b1 = torch.zeros((MLP_REFINER_HIDDEN,), dtype=torch.float32, requires_grad=True)
+  w2 = (torch.randn((MLP_REFINER_HIDDEN, 3), generator=generator) * 0.05).requires_grad_()
+  b2 = torch.zeros((3,), dtype=torch.float32, requires_grad=True)
   params = [w1, b1, w2, b2]
   optimizer = torch.optim.Adam(params, lr=MLP_REFINER_LR)
   batch_size = min(MLP_REFINER_BATCH_SIZE, features.shape[0])
@@ -229,15 +209,18 @@ def _fit_temporal_refiner(src: Path, encoded: Path, dst: Path) -> None:
   mlp_targets = []
   prev_base = None
   prev_prev_base = None
+  prev_linear_residual = None
   for gt, base in zip(_iter_video_tensors(src), _iter_video_tensors(encoded)):
     if prev_base is None:
       prev_base = base
     if prev_prev_base is None:
       prev_prev_base = prev_base
+    if prev_linear_residual is None:
+      prev_linear_residual = _zero_residual_like(base)
     linear_feats = _linear_refiner_features(base, prev_base)
     linear_residual = _predict_linear_refiner_residual(linear_feats, linear_weights)
     linear_refined = _refine_frame(base, linear_residual)
-    feats = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual)
+    feats = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual, prev_linear_residual)
     target = (gt - linear_refined).clamp_(-MLP_REFINER_RESIDUAL_CLAMP, MLP_REFINER_RESIDUAL_CLAMP)
     x = feats[..., ::MLP_REFINER_SAMPLE_STRIDE, ::MLP_REFINER_SAMPLE_STRIDE]
     y = target[..., ::MLP_REFINER_SAMPLE_STRIDE, ::MLP_REFINER_SAMPLE_STRIDE]
@@ -245,6 +228,7 @@ def _fit_temporal_refiner(src: Path, encoded: Path, dst: Path) -> None:
     mlp_targets.append(y.squeeze(0).permute(1, 2, 0).reshape(-1, 3))
     prev_prev_base = prev_base
     prev_base = base
+    prev_linear_residual = linear_residual
 
   mlp_w1, mlp_b1, mlp_w2, mlp_b2 = _fit_mlp_temporal_refiner(
     torch.cat(mlp_features).to(dtype=torch.float32),
@@ -295,15 +279,16 @@ def _apply_temporal_refiner(
   base: torch.Tensor,
   prev_base: torch.Tensor,
   prev_prev_base: torch.Tensor,
+  prev_linear_residual: torch.Tensor,
   refiner: TemporalRefiner | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
   if refiner is None:
-    return base
+    return base, _zero_residual_like(base)
   linear_features = _linear_refiner_features(base, prev_base)
   linear_residual = _predict_linear_refiner_residual(linear_features, refiner.linear)
-  mlp_features = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual)
+  mlp_features = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual, prev_linear_residual)
   residual = linear_residual + _predict_mlp_refiner_residual(mlp_features, refiner)
-  return _refine_frame(base, residual)
+  return _refine_frame(base, residual), linear_residual
 
 
 def _encode_one_video(src: Path, dst: Path, scale_factor: float, crf: int) -> None:
@@ -390,6 +375,7 @@ def _decode_and_resize_to_raw(src: Path, dst: Path, weights: TemporalRefiner | N
   n = 0
   prev_base = None
   prev_prev_base = None
+  prev_linear_residual = None
   with dst.open("wb") as f:
     for frame in container.decode(stream):
       base = _resize_rgb(yuv420_to_rgb(frame)).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
@@ -397,12 +383,15 @@ def _decode_and_resize_to_raw(src: Path, dst: Path, weights: TemporalRefiner | N
         prev_base = base
       if prev_prev_base is None:
         prev_prev_base = prev_base
-      t = _apply_temporal_refiner(base, prev_base, prev_prev_base, weights)
+      if prev_linear_residual is None:
+        prev_linear_residual = _zero_residual_like(base)
+      t, linear_residual = _apply_temporal_refiner(base, prev_base, prev_prev_base, prev_linear_residual, weights)
       prev_prev_base = prev_base
       f.write(
         t.mul(255.0).clamp_(0.0, 255.0).squeeze(0).permute(1, 2, 0).round().to(torch.uint8).contiguous().numpy().tobytes()
       )
       prev_base = base
+      prev_linear_residual = linear_residual
       n += 1
   container.close()
   return n
