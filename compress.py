@@ -16,8 +16,8 @@ import torch.nn.functional as F
 from frame_utils import camera_size, yuv420_to_rgb
 
 HERE = Path(__file__).resolve().parent
-ENCODE_PRESET = "slow"
-ENCODE_GOP = 240
+ENCODE_PRESET = "veryslow"
+ENCODE_GOP = 180
 ENCODE_BFRAMES = 4
 REFINER_FEATURES = 13
 REFINER_SAMPLE_STRIDE = 16
