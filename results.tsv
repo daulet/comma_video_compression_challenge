@@ -2,3 +2,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-05T13:42:11-07:00	986ce02	4.37798374	0.00946626	0.38042203	0.05923665	2224069	improved	baseline x265 intra-only scale=0.45 crf=30 bicubic inflate
 2026-04-05T13:52:34-07:00	00cccc4	3.21599289	0.00731479	0.38144547	0.02125803	798143	improved	x265 long-gop scale=0.45 crf=30 with 78-byte temporal linear refiner
 2026-04-05T13:58:58-07:00	1a3b4b9	3.27364328	0.00827169	0.41518080	0.01635504	614058	not_improved	x265 long-gop scale=0.40 crf=30 with 78-byte temporal linear refiner
+2026-04-05T14:05:09-07:00	7f0a27d	3.45830561	0.00796097	0.47526076	0.01928644	724119	not_improved	x265 long-gop scale=0.43 crf=30 with 78-byte temporal linear refiner
