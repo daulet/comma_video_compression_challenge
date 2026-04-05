@@ -16,14 +16,13 @@ import torch.nn.functional as F
 from frame_utils import camera_size, yuv420_to_rgb
 
 HERE = Path(__file__).resolve().parent
-ENCODE_PRESET = "medium"
+ENCODE_PRESET = "slow"
 ENCODE_GOP = 120
 ENCODE_BFRAMES = 4
-REFINER_FEATURES = 16
+REFINER_FEATURES = 13
 REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
 REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
-REFINER_FIT_ITERS = 2
 
 
 def load_video_names(video_names_file: Path) -> list[str]:
@@ -65,12 +64,12 @@ def _iter_video_tensors(src: Path) -> itertools.chain[torch.Tensor]:
     container.close()
 
 
-def _refiner_features(base: torch.Tensor, prev_recon: torch.Tensor) -> torch.Tensor:
+def _refiner_features(base: torch.Tensor, prev_base: torch.Tensor) -> torch.Tensor:
   blur = F.avg_pool2d(F.pad(base, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
   edge = base - blur
-  delta = base - prev_recon
+  delta = base - prev_base
   bias = torch.ones((1, 1, base.shape[2], base.shape[3]), dtype=base.dtype, device=base.device)
-  return torch.cat([base, edge, prev_recon, delta, delta.abs(), bias], dim=1)
+  return torch.cat([base, edge, delta, delta.abs(), bias], dim=1)
 
 
 def _refiner_path(dst_video: Path) -> Path:
@@ -90,33 +89,25 @@ def _refine_frame(base: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
 
 def _fit_temporal_refiner(src: Path, encoded: Path, dst: Path) -> None:
   print(f"Fitting temporal refiner for {encoded}")
-  weights = torch.zeros((REFINER_FEATURES, 3), dtype=torch.float32)
+  xtx = torch.zeros((REFINER_FEATURES, REFINER_FEATURES), dtype=torch.float64)
+  xty = torch.zeros((REFINER_FEATURES, 3), dtype=torch.float64)
   n_frames = 0
+  prev_base = None
 
-  for fit_iter in range(REFINER_FIT_ITERS):
-    xtx = torch.zeros((REFINER_FEATURES, REFINER_FEATURES), dtype=torch.float64)
-    xty = torch.zeros((REFINER_FEATURES, 3), dtype=torch.float64)
-    prev_recon = None
-    n_frames = 0
+  for gt, base in zip(_iter_video_tensors(src), _iter_video_tensors(encoded)):
+    if prev_base is None:
+      prev_base = base
+    feats = _refiner_features(base, prev_base)[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
+    target = (gt - base)[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
+    x = feats.squeeze(0).permute(1, 2, 0).reshape(-1, REFINER_FEATURES).to(dtype=torch.float64)
+    y = target.squeeze(0).permute(1, 2, 0).reshape(-1, 3).to(dtype=torch.float64)
+    xtx += x.T @ x
+    xty += x.T @ y
+    prev_base = base
+    n_frames += 1
 
-    for gt, base in zip(_iter_video_tensors(src), _iter_video_tensors(encoded)):
-      if prev_recon is None:
-        prev_recon = base
-      features_full = _refiner_features(base, prev_recon)
-      feats = features_full[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
-      target = (gt - base)[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
-      x = feats.squeeze(0).permute(1, 2, 0).reshape(-1, REFINER_FEATURES).to(dtype=torch.float64)
-      y = target.squeeze(0).permute(1, 2, 0).reshape(-1, 3).to(dtype=torch.float64)
-      xtx += x.T @ x
-      xty += x.T @ y
-      prev_recon = _refine_frame(base, _predict_refiner_residual(features_full, weights))
-      n_frames += 1
-
-    ridge = REFINER_RIDGE * torch.eye(REFINER_FEATURES, dtype=torch.float64)
-    weights = torch.linalg.solve(xtx + ridge, xty).to(dtype=torch.float32)
-    print(f"  refiner iteration {fit_iter + 1}/{REFINER_FIT_ITERS} complete")
-
-  weights = weights.to(dtype=torch.float16).cpu().numpy()
+  ridge = REFINER_RIDGE * torch.eye(REFINER_FEATURES, dtype=torch.float64)
+  weights = torch.linalg.solve(xtx + ridge, xty).to(dtype=torch.float16).cpu().numpy()
   dst.write_bytes(weights.tobytes())
   print(f"Saved temporal refiner ({n_frames} frames, {dst.stat().st_size} bytes)")
 
@@ -130,10 +121,10 @@ def _load_temporal_refiner(path: Path) -> torch.Tensor | None:
   return torch.tensor(arr.reshape(REFINER_FEATURES, 3), dtype=torch.float32)
 
 
-def _apply_temporal_refiner(base: torch.Tensor, prev_recon: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
+def _apply_temporal_refiner(base: torch.Tensor, prev_base: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
   if weights is None:
     return base
-  features = _refiner_features(base, prev_recon)
+  features = _refiner_features(base, prev_base)
   residual = _predict_refiner_residual(features, weights)
   return _refine_frame(base, residual)
 
@@ -220,17 +211,17 @@ def _decode_and_resize_to_raw(src: Path, dst: Path, weights: torch.Tensor | None
   stream = container.streams.video[0]
   dst.parent.mkdir(parents=True, exist_ok=True)
   n = 0
-  prev_recon = None
+  prev_base = None
   with dst.open("wb") as f:
     for frame in container.decode(stream):
       base = _resize_rgb(yuv420_to_rgb(frame)).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
-      if prev_recon is None:
-        prev_recon = base
-      t = _apply_temporal_refiner(base, prev_recon, weights)
+      if prev_base is None:
+        prev_base = base
+      t = _apply_temporal_refiner(base, prev_base, weights)
       f.write(
         t.mul(255.0).clamp_(0.0, 255.0).squeeze(0).permute(1, 2, 0).round().to(torch.uint8).contiguous().numpy().tobytes()
       )
-      prev_recon = t
+      prev_base = base
       n += 1
   container.close()
   return n
