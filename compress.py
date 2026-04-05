@@ -18,7 +18,7 @@ from frame_utils import camera_size, yuv420_to_rgb
 HERE = Path(__file__).resolve().parent
 ENCODE_PRESET = "slow"
 ENCODE_GOP = 180
-ENCODE_BFRAMES = 8
+ENCODE_BFRAMES = 4
 REFINER_FEATURES = 13
 REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
@@ -164,7 +164,7 @@ def _encode_one_video(src: Path, dst: Path, scale_factor: float, crf: int) -> No
       str(ENCODE_BFRAMES),
       "-x265-params",
       (
-        f"keyint={ENCODE_GOP}:min-keyint=24:scenecut=40:"
+        f"keyint={ENCODE_GOP}:min-keyint=24:scenecut=0:"
         "aq-mode=3:qcomp=0.70:deblock=-1,-1:log-level=warning"
       ),
       "-r",
