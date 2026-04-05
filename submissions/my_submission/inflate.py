@@ -3,7 +3,6 @@ import av, torch
 import torch.nn.functional as F
 from frame_utils import camera_size, yuv420_to_rgb
 
-# 9x9 binomial Gaussian kernel
 UNSHARP_KERNEL = torch.tensor([
   [1., 8., 28., 56., 70., 56., 28., 8., 1.],
   [8., 64., 224., 448., 560., 448., 224., 64., 8.],
@@ -32,14 +31,7 @@ def decode_and_resize_to_file(video_path: str, dst: str):
         x = F.interpolate(x, size=(target_h, target_w), mode='bicubic', align_corners=False)
         kernel = UNSHARP_KERNEL.to(device=x.device).expand(3, 1, 9, 9)
         blur = F.conv2d(x, kernel, padding=4, groups=3)
-        detail = x - blur
-        # Adaptive sharpening based on local luma variance
-        luma = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
-        local_mean = F.avg_pool2d(F.pad(luma, (4, 4, 4, 4), mode='reflect'), 9, stride=1)
-        local_sq_mean = F.avg_pool2d(F.pad(luma ** 2, (4, 4, 4, 4), mode='reflect'), 9, stride=1)
-        local_var = (local_sq_mean - local_mean ** 2).clamp(min=0)
-        alpha_map = 0.4 + 0.8 * (local_var / (local_var + 100.0))
-        x = x + alpha_map * detail
+        x = x + 0.85 * (x - blur)
         t = x.clamp(0, 255).squeeze(0).permute(1, 2, 0).round().to(torch.uint8)
       f.write(t.contiguous().numpy().tobytes())
       n += 1

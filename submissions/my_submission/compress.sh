@@ -27,7 +27,7 @@ done
 rm -rf "$ARCHIVE_DIR"
 mkdir -p "$ARCHIVE_DIR"
 
-export IN_DIR ARCHIVE_DIR
+export IN_DIR ARCHIVE_DIR PD
 
 head -n "$(wc -l < "$VIDEO_NAMES_FILE")" "$VIDEO_NAMES_FILE" | xargs -P"$JOBS" -I{} bash -lc '
   rel="$1"
@@ -39,11 +39,13 @@ head -n "$(wc -l < "$VIDEO_NAMES_FILE")" "$VIDEO_NAMES_FILE" | xargs -P"$JOBS" -
 
   echo "→ ${IN}  →  ${OUT}"
 
-  ffmpeg -nostdin -y -hide_banner -loglevel warning \
+  FFMPEG="${PD}/ffmpeg-new"
+  [ ! -x "$FFMPEG" ] && FFMPEG="ffmpeg"
+  "$FFMPEG" -nostdin -y -hide_banner -loglevel warning \
     -r 20 -fflags +genpts -i "$IN" \
     -vf "scale=trunc(iw*0.45/2)*2:trunc(ih*0.45/2)*2:flags=lanczos" \
     -pix_fmt yuv420p -c:v libsvtav1 -preset 0 -crf 33 \
-    -svtav1-params "film-grain=22:keyint=180:scd=0:sharpness=1" \
+    -svtav1-params "film-grain=22:keyint=180:scd=0" \
     -r 20 "$OUT"
 ' _ {}
 
