@@ -17,7 +17,7 @@ from frame_utils import camera_size, yuv420_to_rgb
 
 HERE = Path(__file__).resolve().parent
 ENCODE_PRESET = "slow"
-ENCODE_GOP = 120
+ENCODE_GOP = 180
 ENCODE_BFRAMES = 4
 REFINER_FEATURES = 13
 REFINER_SAMPLE_STRIDE = 16
@@ -181,7 +181,7 @@ def compress_videos(
   archive_zip: Path,
   *,
   scale_factor: float = 0.45,
-  crf: int = 31,
+  crf: int = 30,
 ) -> None:
   _reset_dir(archive_dir)
 
@@ -251,7 +251,7 @@ def _parse_args() -> argparse.Namespace:
   compress_parser.add_argument("--archive-dir", type=Path, default=HERE / "autoresearch_work" / "archive_build")
   compress_parser.add_argument("--archive-zip", type=Path, default=HERE / "autoresearch_work" / "archive.zip")
   compress_parser.add_argument("--scale-factor", type=float, default=0.45)
-  compress_parser.add_argument("--crf", type=int, default=31)
+  compress_parser.add_argument("--crf", type=int, default=30)
 
   inflate_parser = subparsers.add_parser("inflate", help="inflate archive dir into .raw files")
   inflate_parser.add_argument("--archive-dir", type=Path, required=True)

@@ -6,3 +6,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-05T14:16:26-07:00	6a308ec	3.21868431	0.00732039	0.38227403	0.02125851	798161	not_improved	x265 long-gop scale=0.45 crf=30 with 96-byte causal temporal refiner
 2026-04-05T14:23:27-07:00	5aeb743	3.17937821	0.00642251	0.38421512	0.02307947	866530	improved	x265 slow scale=0.45 crf=30 with 78-byte temporal linear refiner
 2026-04-05T14:28:58-07:00	ce1339f	3.29259949	0.00709540	0.44095489	0.01932669	725630	not_improved	x265 slow scale=0.45 crf=31 with 78-byte temporal linear refiner
+2026-04-05T14:39:16-07:00	dc07c3c	3.09036412	0.00650231	0.34791011	0.02299592	863393	improved	x265 slow scale=0.45 crf=30 gop=180 with 78-byte temporal linear refiner
