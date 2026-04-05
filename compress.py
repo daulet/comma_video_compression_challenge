@@ -6,6 +6,7 @@ import itertools
 import shutil
 import subprocess
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 
 import av
@@ -19,10 +20,27 @@ HERE = Path(__file__).resolve().parent
 ENCODE_PRESET = "slow"
 ENCODE_GOP = 180
 ENCODE_BFRAMES = 4
-REFINER_FEATURES = 13
-REFINER_SAMPLE_STRIDE = 16
+LINEAR_REFINER_FEATURES = 13
+LINEAR_REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
-REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
+LINEAR_REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
+MLP_REFINER_FEATURES = 16
+MLP_REFINER_HIDDEN = 4
+MLP_REFINER_SAMPLE_STRIDE = 32
+MLP_REFINER_MAX_SAMPLES = 200_000
+MLP_REFINER_STEPS = 192
+MLP_REFINER_BATCH_SIZE = 8192
+MLP_REFINER_LR = 3e-2
+MLP_REFINER_RESIDUAL_CLAMP = 10.0 / 255.0
+
+
+@dataclass(frozen=True)
+class TemporalRefiner:
+  linear: torch.Tensor
+  mlp_w1: torch.Tensor
+  mlp_b1: torch.Tensor
+  mlp_w2: torch.Tensor
+  mlp_b2: torch.Tensor
 
 
 def load_video_names(video_names_file: Path) -> list[str]:
@@ -64,7 +82,7 @@ def _iter_video_tensors(src: Path) -> itertools.chain[torch.Tensor]:
     container.close()
 
 
-def _refiner_features(base: torch.Tensor, prev_base: torch.Tensor) -> torch.Tensor:
+def _linear_refiner_features(base: torch.Tensor, prev_base: torch.Tensor) -> torch.Tensor:
   blur = F.avg_pool2d(F.pad(base, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
   edge = base - blur
   delta = base - prev_base
@@ -72,13 +90,33 @@ def _refiner_features(base: torch.Tensor, prev_base: torch.Tensor) -> torch.Tens
   return torch.cat([base, edge, delta, delta.abs(), bias], dim=1)
 
 
+def _mlp_refiner_features(
+  base: torch.Tensor,
+  prev_base: torch.Tensor,
+  prev_prev_base: torch.Tensor,
+  linear_residual: torch.Tensor,
+) -> torch.Tensor:
+  delta = base - prev_base
+  prev_delta = prev_base - prev_prev_base
+  linear = linear_residual.permute(2, 0, 1).unsqueeze(0)
+  bias = torch.ones((1, 1, base.shape[2], base.shape[3]), dtype=base.dtype, device=base.device)
+  return torch.cat([base, delta, delta.abs(), prev_delta, linear, bias], dim=1)
+
+
 def _refiner_path(dst_video: Path) -> Path:
   return dst_video.with_suffix(".refiner.bin")
 
 
-def _predict_refiner_residual(features: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+def _predict_linear_refiner_residual(features: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
   return torch.matmul(features.squeeze(0).permute(1, 2, 0), weights).clamp_(
-    -REFINER_RESIDUAL_CLAMP, REFINER_RESIDUAL_CLAMP
+    -LINEAR_REFINER_RESIDUAL_CLAMP, LINEAR_REFINER_RESIDUAL_CLAMP
+  )
+
+
+def _predict_mlp_refiner_residual(features: torch.Tensor, refiner: TemporalRefiner) -> torch.Tensor:
+  hidden = torch.tanh(torch.matmul(features.squeeze(0).permute(1, 2, 0), refiner.mlp_w1) + refiner.mlp_b1)
+  return torch.matmul(hidden, refiner.mlp_w2).add_(refiner.mlp_b2).clamp_(
+    -MLP_REFINER_RESIDUAL_CLAMP, MLP_REFINER_RESIDUAL_CLAMP
   )
 
 
@@ -87,45 +125,158 @@ def _refine_frame(base: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
   return refined.permute(2, 0, 1).unsqueeze(0)
 
 
+def _fit_mlp_temporal_refiner(features: torch.Tensor, targets: torch.Tensor) -> tuple[torch.Tensor, ...]:
+  if features.shape[0] > MLP_REFINER_MAX_SAMPLES:
+    generator = torch.Generator().manual_seed(0)
+    keep = torch.randperm(features.shape[0], generator=generator)[:MLP_REFINER_MAX_SAMPLES]
+    features = features[keep]
+    targets = targets[keep]
+
+  generator = torch.Generator().manual_seed(0)
+  w1 = (torch.randn((MLP_REFINER_FEATURES, MLP_REFINER_HIDDEN), generator=generator) * 0.05).requires_grad_()
+  b1 = torch.zeros((MLP_REFINER_HIDDEN,), dtype=torch.float32, requires_grad=True)
+  w2 = (torch.randn((MLP_REFINER_HIDDEN, 3), generator=generator) * 0.05).requires_grad_()
+  b2 = torch.zeros((3,), dtype=torch.float32, requires_grad=True)
+  params = [w1, b1, w2, b2]
+  optimizer = torch.optim.Adam(params, lr=MLP_REFINER_LR)
+  batch_size = min(MLP_REFINER_BATCH_SIZE, features.shape[0])
+
+  for _ in range(MLP_REFINER_STEPS):
+    batch_idx = torch.randint(features.shape[0], (batch_size,), generator=generator)
+    xb = features[batch_idx]
+    yb = targets[batch_idx]
+    hidden = torch.tanh(xb @ w1 + b1)
+    pred = (hidden @ w2 + b2).clamp(-MLP_REFINER_RESIDUAL_CLAMP, MLP_REFINER_RESIDUAL_CLAMP)
+    loss = F.smooth_l1_loss(pred, yb)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+
+  with torch.inference_mode():
+    hidden = torch.tanh(features @ w1 + b1)
+    pred = (hidden @ w2 + b2).clamp(-MLP_REFINER_RESIDUAL_CLAMP, MLP_REFINER_RESIDUAL_CLAMP)
+    loss = F.smooth_l1_loss(pred, targets).item()
+    print(f"Fitted tiny temporal MLP on {features.shape[0]} samples (loss={loss:.6f})")
+
+  return (
+    w1.detach().to(dtype=torch.float16),
+    b1.detach().to(dtype=torch.float16),
+    w2.detach().to(dtype=torch.float16),
+    b2.detach().to(dtype=torch.float16),
+  )
+
+
+def _save_temporal_refiner(dst: Path, refiner: TemporalRefiner) -> None:
+  arrays = [
+    refiner.linear.cpu().numpy().reshape(-1),
+    refiner.mlp_w1.cpu().numpy().reshape(-1),
+    refiner.mlp_b1.cpu().numpy().reshape(-1),
+    refiner.mlp_w2.cpu().numpy().reshape(-1),
+    refiner.mlp_b2.cpu().numpy().reshape(-1),
+  ]
+  dst.write_bytes(np.concatenate(arrays).astype(np.float16).tobytes())
+
+
 def _fit_temporal_refiner(src: Path, encoded: Path, dst: Path) -> None:
   print(f"Fitting temporal refiner for {encoded}")
-  xtx = torch.zeros((REFINER_FEATURES, REFINER_FEATURES), dtype=torch.float64)
-  xty = torch.zeros((REFINER_FEATURES, 3), dtype=torch.float64)
+  xtx = torch.zeros((LINEAR_REFINER_FEATURES, LINEAR_REFINER_FEATURES), dtype=torch.float64)
+  xty = torch.zeros((LINEAR_REFINER_FEATURES, 3), dtype=torch.float64)
   n_frames = 0
   prev_base = None
 
   for gt, base in zip(_iter_video_tensors(src), _iter_video_tensors(encoded)):
     if prev_base is None:
       prev_base = base
-    feats = _refiner_features(base, prev_base)[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
-    target = (gt - base)[..., ::REFINER_SAMPLE_STRIDE, ::REFINER_SAMPLE_STRIDE]
-    x = feats.squeeze(0).permute(1, 2, 0).reshape(-1, REFINER_FEATURES).to(dtype=torch.float64)
+    feats = _linear_refiner_features(base, prev_base)[..., ::LINEAR_REFINER_SAMPLE_STRIDE, ::LINEAR_REFINER_SAMPLE_STRIDE]
+    target = (gt - base)[..., ::LINEAR_REFINER_SAMPLE_STRIDE, ::LINEAR_REFINER_SAMPLE_STRIDE]
+    x = feats.squeeze(0).permute(1, 2, 0).reshape(-1, LINEAR_REFINER_FEATURES).to(dtype=torch.float64)
     y = target.squeeze(0).permute(1, 2, 0).reshape(-1, 3).to(dtype=torch.float64)
     xtx += x.T @ x
     xty += x.T @ y
     prev_base = base
     n_frames += 1
 
-  ridge = REFINER_RIDGE * torch.eye(REFINER_FEATURES, dtype=torch.float64)
-  weights = torch.linalg.solve(xtx + ridge, xty).to(dtype=torch.float16).cpu().numpy()
-  dst.write_bytes(weights.tobytes())
+  ridge = REFINER_RIDGE * torch.eye(LINEAR_REFINER_FEATURES, dtype=torch.float64)
+  linear_weights = torch.linalg.solve(xtx + ridge, xty).to(dtype=torch.float32)
+
+  mlp_features = []
+  mlp_targets = []
+  prev_base = None
+  prev_prev_base = None
+  for gt, base in zip(_iter_video_tensors(src), _iter_video_tensors(encoded)):
+    if prev_base is None:
+      prev_base = base
+    if prev_prev_base is None:
+      prev_prev_base = prev_base
+    linear_feats = _linear_refiner_features(base, prev_base)
+    linear_residual = _predict_linear_refiner_residual(linear_feats, linear_weights)
+    linear_refined = _refine_frame(base, linear_residual)
+    feats = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual)
+    target = (gt - linear_refined).clamp_(-MLP_REFINER_RESIDUAL_CLAMP, MLP_REFINER_RESIDUAL_CLAMP)
+    x = feats[..., ::MLP_REFINER_SAMPLE_STRIDE, ::MLP_REFINER_SAMPLE_STRIDE]
+    y = target[..., ::MLP_REFINER_SAMPLE_STRIDE, ::MLP_REFINER_SAMPLE_STRIDE]
+    mlp_features.append(x.squeeze(0).permute(1, 2, 0).reshape(-1, MLP_REFINER_FEATURES))
+    mlp_targets.append(y.squeeze(0).permute(1, 2, 0).reshape(-1, 3))
+    prev_prev_base = prev_base
+    prev_base = base
+
+  mlp_w1, mlp_b1, mlp_w2, mlp_b2 = _fit_mlp_temporal_refiner(
+    torch.cat(mlp_features).to(dtype=torch.float32),
+    torch.cat(mlp_targets).to(dtype=torch.float32),
+  )
+  refiner = TemporalRefiner(
+    linear=linear_weights.to(dtype=torch.float16),
+    mlp_w1=mlp_w1,
+    mlp_b1=mlp_b1,
+    mlp_w2=mlp_w2,
+    mlp_b2=mlp_b2,
+  )
+  _save_temporal_refiner(dst, refiner)
   print(f"Saved temporal refiner ({n_frames} frames, {dst.stat().st_size} bytes)")
 
 
-def _load_temporal_refiner(path: Path) -> torch.Tensor | None:
+def _load_temporal_refiner(path: Path) -> TemporalRefiner | None:
   if not path.exists():
     return None
   arr = np.frombuffer(path.read_bytes(), dtype=np.float16)
-  if arr.size != REFINER_FEATURES * 3:
+  expected = (
+    LINEAR_REFINER_FEATURES * 3
+    + MLP_REFINER_FEATURES * MLP_REFINER_HIDDEN
+    + MLP_REFINER_HIDDEN
+    + MLP_REFINER_HIDDEN * 3
+    + 3
+  )
+  if arr.size != expected:
     raise ValueError(f"Unexpected refiner size for {path}: {arr.size}")
-  return torch.tensor(arr.reshape(REFINER_FEATURES, 3), dtype=torch.float32)
+  offset = 0
+
+  def take(count: int, shape: tuple[int, ...]) -> torch.Tensor:
+    nonlocal offset
+    out = torch.tensor(arr[offset:offset + count].reshape(shape), dtype=torch.float32)
+    offset += count
+    return out
+
+  return TemporalRefiner(
+    linear=take(LINEAR_REFINER_FEATURES * 3, (LINEAR_REFINER_FEATURES, 3)),
+    mlp_w1=take(MLP_REFINER_FEATURES * MLP_REFINER_HIDDEN, (MLP_REFINER_FEATURES, MLP_REFINER_HIDDEN)),
+    mlp_b1=take(MLP_REFINER_HIDDEN, (MLP_REFINER_HIDDEN,)),
+    mlp_w2=take(MLP_REFINER_HIDDEN * 3, (MLP_REFINER_HIDDEN, 3)),
+    mlp_b2=take(3, (3,)),
+  )
 
 
-def _apply_temporal_refiner(base: torch.Tensor, prev_base: torch.Tensor, weights: torch.Tensor | None) -> torch.Tensor:
-  if weights is None:
+def _apply_temporal_refiner(
+  base: torch.Tensor,
+  prev_base: torch.Tensor,
+  prev_prev_base: torch.Tensor,
+  refiner: TemporalRefiner | None,
+) -> torch.Tensor:
+  if refiner is None:
     return base
-  features = _refiner_features(base, prev_base)
-  residual = _predict_refiner_residual(features, weights)
+  linear_features = _linear_refiner_features(base, prev_base)
+  linear_residual = _predict_linear_refiner_residual(linear_features, refiner.linear)
+  mlp_features = _mlp_refiner_features(base, prev_base, prev_prev_base, linear_residual)
+  residual = linear_residual + _predict_mlp_refiner_residual(mlp_features, refiner)
   return _refine_frame(base, residual)
 
 
@@ -205,19 +356,23 @@ def compress_videos(
   print(f"Compressed to {archive_zip}")
 
 
-def _decode_and_resize_to_raw(src: Path, dst: Path, weights: torch.Tensor | None) -> int:
+def _decode_and_resize_to_raw(src: Path, dst: Path, weights: TemporalRefiner | None) -> int:
   fmt = "hevc" if src.suffix == ".hevc" else None
   container = av.open(str(src), format=fmt)
   stream = container.streams.video[0]
   dst.parent.mkdir(parents=True, exist_ok=True)
   n = 0
   prev_base = None
+  prev_prev_base = None
   with dst.open("wb") as f:
     for frame in container.decode(stream):
       base = _resize_rgb(yuv420_to_rgb(frame)).permute(2, 0, 1).unsqueeze(0).float().div_(255.0)
       if prev_base is None:
         prev_base = base
-      t = _apply_temporal_refiner(base, prev_base, weights)
+      if prev_prev_base is None:
+        prev_prev_base = prev_base
+      t = _apply_temporal_refiner(base, prev_base, prev_prev_base, weights)
+      prev_prev_base = prev_base
       f.write(
         t.mul(255.0).clamp_(0.0, 255.0).squeeze(0).permute(1, 2, 0).round().to(torch.uint8).contiguous().numpy().tobytes()
       )
