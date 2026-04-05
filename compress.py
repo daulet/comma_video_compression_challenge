@@ -181,7 +181,7 @@ def compress_videos(
   archive_zip: Path,
   *,
   scale_factor: float = 0.45,
-  crf: int = 30,
+  crf: int = 31,
 ) -> None:
   _reset_dir(archive_dir)
 
@@ -251,7 +251,7 @@ def _parse_args() -> argparse.Namespace:
   compress_parser.add_argument("--archive-dir", type=Path, default=HERE / "autoresearch_work" / "archive_build")
   compress_parser.add_argument("--archive-zip", type=Path, default=HERE / "autoresearch_work" / "archive.zip")
   compress_parser.add_argument("--scale-factor", type=float, default=0.45)
-  compress_parser.add_argument("--crf", type=int, default=30)
+  compress_parser.add_argument("--crf", type=int, default=31)
 
   inflate_parser = subparsers.add_parser("inflate", help="inflate archive dir into .raw files")
   inflate_parser.add_argument("--archive-dir", type=Path, required=True)
