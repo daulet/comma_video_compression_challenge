@@ -14,3 +14,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-05T15:21:29-07:00	69a37c7	3.09036212	0.00650231	0.34791011	0.02299584	863390	improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 78-byte temporal linear refiner
 2026-04-05T15:38:42-07:00	9e6a60e	3.07564903	0.00652423	0.34159115	0.02300029	863557	improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 244-byte temporal MLP refiner
 2026-04-05T15:49:41-07:00	7e824eb	3.08947023	0.00651899	0.34690842	0.02300095	863582	not_improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 268-byte temporal MLP refiner plus edge features
+2026-04-05T16:16:49-07:00	711c5fe	3.09993415	0.00655250	0.34956905	0.02300031	863558	not_improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 244-byte temporal MLP refiner initialized from extra-video prior and 128-step fine-tune

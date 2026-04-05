@@ -24,14 +24,40 @@ LINEAR_REFINER_FEATURES = 13
 LINEAR_REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
 LINEAR_REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
-MLP_REFINER_FEATURES = 19
+MLP_REFINER_FEATURES = 16
 MLP_REFINER_HIDDEN = 4
 MLP_REFINER_SAMPLE_STRIDE = 32
 MLP_REFINER_MAX_SAMPLES = 200_000
-MLP_REFINER_STEPS = 192
+MLP_REFINER_STEPS = 128
 MLP_REFINER_BATCH_SIZE = 8192
 MLP_REFINER_LR = 3e-2
 MLP_REFINER_RESIDUAL_CLAMP = 10.0 / 255.0
+MLP_INIT_W1 = [
+  [-0.05078125, -0.0341796875, -0.006595611572265625, -0.01413726806640625],
+  [0.043212890625, 0.0772705078125, -0.0184478759765625, -0.088623046875],
+  [0.00907135009765625, -0.01983642578125, 0.0024166107177734375, 0.037017822265625],
+  [-0.10430908203125, -0.0701904296875, -0.0269775390625, -0.048004150390625],
+  [-0.099853515625, 0.0287322998046875, 0.09033203125, 0.0594482421875],
+  [-0.0181427001953125, 0.03912353515625, 0.037017822265625, 0.10394287109375],
+  [0.03253173828125, -0.024566650390625, -0.032562255859375, -0.0311279296875],
+  [0.05718994140625, 0.091064453125, 0.010284423828125, -0.0733642578125],
+  [-0.02752685546875, -0.0072479248046875, -0.0267791748046875, -0.042388916015625],
+  [0.047332763671875, -0.1612548828125, -0.07086181640625, 0.051788330078125],
+  [0.09564208984375, 0.1793212890625, 0.06500244140625, 0.058441162109375],
+  [0.09320068359375, -0.053741455078125, -0.1165771484375, -0.0460205078125],
+  [0.041748046875, 1.349609375, -0.056396484375, 0.67236328125],
+  [0.045623779296875, -1.5673828125, 0.2034912109375, -0.7255859375],
+  [-0.046539306640625, -0.002361297607421875, 0.37890625, -0.046722412109375],
+  [-0.06695556640625, -0.047821044921875, 0.00921630859375, -0.0160675048828125],
+]
+MLP_INIT_B1 = [0.00962066650390625, 0.013885498046875, -0.081787109375, 0.01151275634765625]
+MLP_INIT_W2 = [
+  [-0.0234832763671875, -0.006908416748046875, 0.057464599609375],
+  [0.07470703125, 0.01273345947265625, 0.009918212890625],
+  [-0.038970947265625, -0.030731201171875, 0.07421875],
+  [0.018829345703125, 0.0258026123046875, -0.0037899017333984375],
+]
+MLP_INIT_B2 = [-0.00275421142578125, -0.0018014907836914062, 0.00930023193359375]
 
 
 @dataclass(frozen=True)
@@ -96,13 +122,11 @@ def _mlp_refiner_features(
   prev_prev_base: torch.Tensor,
   linear_residual: torch.Tensor,
 ) -> torch.Tensor:
-  blur = F.avg_pool2d(F.pad(base, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
-  edge = base - blur
   delta = base - prev_base
   prev_delta = prev_base - prev_prev_base
   linear = linear_residual.permute(2, 0, 1).unsqueeze(0)
   bias = torch.ones((1, 1, base.shape[2], base.shape[3]), dtype=base.dtype, device=base.device)
-  return torch.cat([base, edge, delta, delta.abs(), prev_delta, linear, bias], dim=1)
+  return torch.cat([base, delta, delta.abs(), prev_delta, linear, bias], dim=1)
 
 
 def _refiner_path(dst_video: Path) -> Path:
@@ -135,10 +159,10 @@ def _fit_mlp_temporal_refiner(features: torch.Tensor, targets: torch.Tensor) -> 
     targets = targets[keep]
 
   generator = torch.Generator().manual_seed(0)
-  w1 = (torch.randn((MLP_REFINER_FEATURES, MLP_REFINER_HIDDEN), generator=generator) * 0.05).requires_grad_()
-  b1 = torch.zeros((MLP_REFINER_HIDDEN,), dtype=torch.float32, requires_grad=True)
-  w2 = (torch.randn((MLP_REFINER_HIDDEN, 3), generator=generator) * 0.05).requires_grad_()
-  b2 = torch.zeros((3,), dtype=torch.float32, requires_grad=True)
+  w1 = torch.tensor(MLP_INIT_W1, dtype=torch.float32, requires_grad=True)
+  b1 = torch.tensor(MLP_INIT_B1, dtype=torch.float32, requires_grad=True)
+  w2 = torch.tensor(MLP_INIT_W2, dtype=torch.float32, requires_grad=True)
+  b2 = torch.tensor(MLP_INIT_B2, dtype=torch.float32, requires_grad=True)
   params = [w1, b1, w2, b2]
   optimizer = torch.optim.Adam(params, lr=MLP_REFINER_LR)
   batch_size = min(MLP_REFINER_BATCH_SIZE, features.shape[0])
