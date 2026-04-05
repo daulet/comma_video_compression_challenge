@@ -24,7 +24,7 @@ LINEAR_REFINER_FEATURES = 13
 LINEAR_REFINER_SAMPLE_STRIDE = 16
 REFINER_RIDGE = 1e-2
 LINEAR_REFINER_RESIDUAL_CLAMP = 24.0 / 255.0
-MLP_REFINER_FEATURES = 16
+MLP_REFINER_FEATURES = 19
 MLP_REFINER_HIDDEN = 4
 MLP_REFINER_SAMPLE_STRIDE = 32
 MLP_REFINER_MAX_SAMPLES = 200_000
@@ -96,11 +96,13 @@ def _mlp_refiner_features(
   prev_prev_base: torch.Tensor,
   linear_residual: torch.Tensor,
 ) -> torch.Tensor:
+  blur = F.avg_pool2d(F.pad(base, (1, 1, 1, 1), mode="replicate"), kernel_size=3, stride=1)
+  edge = base - blur
   delta = base - prev_base
   prev_delta = prev_base - prev_prev_base
   linear = linear_residual.permute(2, 0, 1).unsqueeze(0)
   bias = torch.ones((1, 1, base.shape[2], base.shape[3]), dtype=base.dtype, device=base.device)
-  return torch.cat([base, delta, delta.abs(), prev_delta, linear, bias], dim=1)
+  return torch.cat([base, edge, delta, delta.abs(), prev_delta, linear, bias], dim=1)
 
 
 def _refiner_path(dst_video: Path) -> Path:
