@@ -98,17 +98,39 @@ def _apply_unsharp(x: torch.Tensor, strength: float = 0.85) -> torch.Tensor:
   return (x + strength * (x - blur)).clamp(0, 255)
 
 
-def _train_filter_with_eval_loss(
+def _boundary_priority_map(classes: torch.Tensor) -> torch.Tensor:
+  boundary = torch.zeros_like(classes, dtype=torch.bool)
+  boundary[:, 1:, :] |= classes[:, 1:, :] != classes[:, :-1, :]
+  boundary[:, :-1, :] |= classes[:, 1:, :] != classes[:, :-1, :]
+  boundary[:, :, 1:] |= classes[:, :, 1:] != classes[:, :, :-1]
+  boundary[:, :, :-1] |= classes[:, :, 1:] != classes[:, :, :-1]
+  return 1.0 + 2.0 * boundary.float()
+
+
+def _segmentation_margin_loss(
+  logits: torch.Tensor,
+  target_classes: torch.Tensor,
+  pixel_weights: torch.Tensor,
+  margin: float = 0.25,
+) -> torch.Tensor:
+  target_logits = logits.gather(1, target_classes.unsqueeze(1)).squeeze(1)
+  class_mask = F.one_hot(target_classes, num_classes=logits.shape[1]).permute(0, 3, 1, 2).bool()
+  other_logits = logits.masked_fill(class_mask, float("-inf")).amax(dim=1)
+  loss = F.relu(margin - (target_logits - other_logits))
+  return (loss * pixel_weights).sum() / pixel_weights.sum().clamp_min(1.0)
+
+
+def _train_filter_bank_with_eval_loss(
   original_frames: list[torch.Tensor],
   upsampled_chw: list[torch.Tensor],
   n_iters: int = 300,
   batch_size: int = 2,
   lr: float = 1e-3,
-) -> LinearFilter:
+) -> tuple[LinearFilter, LinearFilter]:
   from modules import DistortionNet, posenet_sd_path, segnet_sd_path
 
   eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
-  n_frames = len(original_frames)
+  n_pairs = len(original_frames) // 2
 
   print("  Loading eval models...", flush=True)
   distortion_net = DistortionNet().eval()
@@ -117,68 +139,81 @@ def _train_filter_with_eval_loss(
     p.requires_grad_(False)
 
   print("  Preparing eval-resolution frames...", flush=True)
-  original_eval = []
   upsampled_eval = []
-  for i in range(n_frames):
-    o = original_frames[i].permute(2, 0, 1).unsqueeze(0).float()
-    o = F.interpolate(o, size=(eval_h, eval_w), mode="bilinear", align_corners=False)
-    original_eval.append(o)
-    u = F.interpolate(upsampled_chw[i], size=(eval_h, eval_w), mode="bilinear", align_corners=False)
-    upsampled_eval.append(u)
+  original_eval = []
+  for original, upsampled in zip(original_frames, upsampled_chw, strict=True):
+    o = original.permute(2, 0, 1).unsqueeze(0).float()
+    original_eval.append(F.interpolate(o, size=(eval_h, eval_w), mode="bilinear", align_corners=False))
+    upsampled_eval.append(F.interpolate(upsampled, size=(eval_h, eval_w), mode="bilinear", align_corners=False))
 
   print("  Pre-computing original eval outputs...", flush=True)
-  orig_posenet_outs = []
-  orig_segnet_outs = []
+  orig_pose_targets = []
+  orig_seg_classes = []
+  orig_seg_weights = []
   with torch.no_grad():
-    for i in range(n_frames - 1):
+    for pair_idx in range(n_pairs):
+      i = pair_idx * 2
       pair = torch.stack([
         original_eval[i].squeeze(0).permute(1, 2, 0),
         original_eval[i + 1].squeeze(0).permute(1, 2, 0),
       ], dim=0).unsqueeze(0)
       po, so = distortion_net(pair)
-      orig_posenet_outs.append({k: v.detach() for k, v in po.items()})
-      orig_segnet_outs.append(so.detach())
-  print(f"  Pre-computed {len(orig_posenet_outs)} pairs", flush=True)
+      classes = so.argmax(dim=1).detach().to(torch.uint8)
+      orig_pose_targets.append(po["pose"][:, :6].detach())
+      orig_seg_classes.append(classes)
+      orig_seg_weights.append(_boundary_priority_map(classes.long()))
+  print(f"  Pre-computed {len(orig_pose_targets)} evaluator pairs", flush=True)
 
-  filt = LinearFilter(kernel_size=9)
-  print(f"  LinearFilter: {_count_params(filt)} params (init from unsharp)", flush=True)
-  optimizer = torch.optim.Adam(filt.parameters(), lr=lr)
+  even_filt = LinearFilter(kernel_size=9)
+  odd_filt = LinearFilter(kernel_size=9)
+  print(
+    f"  LinearFilter bank: even={_count_params(even_filt)} odd={_count_params(odd_filt)} params",
+    flush=True,
+  )
+  optimizer = torch.optim.Adam(
+    list(even_filt.parameters()) + list(odd_filt.parameters()),
+    lr=lr,
+  )
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
 
-  filt.train()
+  even_filt.train()
+  odd_filt.train()
   running_loss = 0.0
   running_pose = 0.0
   running_seg = 0.0
 
   for it in range(n_iters):
-    pair_indices = [random.randint(0, n_frames - 2) for _ in range(batch_size)]
+    pair_indices = [random.randrange(n_pairs) for _ in range(batch_size)]
 
     filtered_pairs = []
-    orig_pose_batch = []
-    orig_seg_batch = []
+    pose_targets = []
+    seg_targets = []
+    seg_weights = []
 
-    for i in pair_indices:
-      f_i = filt(upsampled_eval[i])
-      f_i1 = filt(upsampled_eval[i + 1])
+    for pair_idx in pair_indices:
+      i = pair_idx * 2
+      f_i = even_filt(upsampled_eval[i])
+      f_i1 = odd_filt(upsampled_eval[i + 1])
 
       pair = torch.stack([
         f_i.squeeze(0).permute(1, 2, 0),
         f_i1.squeeze(0).permute(1, 2, 0),
       ], dim=0).unsqueeze(0)
       filtered_pairs.append(pair)
-      orig_pose_batch.append(orig_posenet_outs[i])
-      orig_seg_batch.append(orig_segnet_outs[i])
+      pose_targets.append(orig_pose_targets[pair_idx])
+      seg_targets.append(orig_seg_classes[pair_idx])
+      seg_weights.append(orig_seg_weights[pair_idx])
 
     filtered_batch = torch.cat(filtered_pairs, dim=0)
 
     enh_po, enh_so = distortion_net(filtered_batch)
 
-    orig_pose = torch.cat([orig_pose_batch[j]["pose"] for j in range(batch_size)])
-    loss_posenet = F.mse_loss(enh_po["pose"][:, :6], orig_pose[:, :6])
+    pose_target = torch.cat(pose_targets, dim=0)
+    loss_posenet = F.mse_loss(enh_po["pose"][:, :6], pose_target)
 
-    orig_seg = torch.cat(orig_seg_batch)
-    orig_classes = orig_seg.argmax(dim=1)
-    loss_segnet = F.cross_entropy(enh_so, orig_classes)
+    target_classes = torch.cat(seg_targets, dim=0).long()
+    pixel_weights = torch.cat(seg_weights, dim=0)
+    loss_segnet = _segmentation_margin_loss(enh_so, target_classes, pixel_weights)
 
     loss = 10.0 * loss_posenet + 1.0 * loss_segnet
 
@@ -199,8 +234,9 @@ def _train_filter_with_eval_loss(
       )
       running_loss = running_pose = running_seg = 0.0
 
-  filt.eval()
-  return filt
+  even_filt.eval()
+  odd_filt.eval()
+  return even_filt, odd_filt
 
 
 def _save_filter(filt: LinearFilter, path: Path) -> int:
@@ -221,6 +257,31 @@ def _load_filter(path: Path) -> LinearFilter:
   filt.load_state_dict(state)
   filt.eval()
   return filt
+
+
+def _save_filter_bank(even_filt: LinearFilter, odd_filt: LinearFilter, path: Path) -> int:
+  state = {
+    "even": {k: v.half() for k, v in even_filt.state_dict().items()},
+    "odd": {k: v.half() for k, v in odd_filt.state_dict().items()},
+  }
+  buf = io.BytesIO()
+  torch.save(state, buf)
+  data = buf.getvalue()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_bytes(data)
+  print(f"Saved LinearFilter bank: {len(data)} bytes", flush=True)
+  return len(data)
+
+
+def _load_filter_bank(path: Path) -> tuple[LinearFilter, LinearFilter]:
+  state = torch.load(path, map_location="cpu", weights_only=True)
+  even_filt = LinearFilter(kernel_size=9)
+  odd_filt = LinearFilter(kernel_size=9)
+  even_filt.load_state_dict({k: v.float() for k, v in state["even"].items()})
+  odd_filt.load_state_dict({k: v.float() for k, v in state["odd"].items()})
+  even_filt.eval()
+  odd_filt.eval()
+  return even_filt, odd_filt
 
 
 SVTAV1_ENC = Path("/tmp/SVT-AV1/Bin/Release/SvtAv1EncApp")
@@ -379,10 +440,10 @@ def compress_videos(
     upsampled_chw = [_bicubic_upsample(f, target_h, target_w) for f in compressed_frames]
     print(f"  {len(compressed_frames)} frames", flush=True)
 
-    print("Training LinearFilter with eval model loss...", flush=True)
-    filt = _train_filter_with_eval_loss(original_frames, upsampled_chw)
+    print("Training parity-specific LinearFilter bank with eval model loss...", flush=True)
+    even_filt, odd_filt = _train_filter_bank_with_eval_loss(original_frames, upsampled_chw)
 
-    _save_filter(filt, archive_dir / "linear_filter.pt")
+    _save_filter_bank(even_filt, odd_filt, archive_dir / "linear_filter_bank.pt")
     del original_frames, compressed_frames, upsampled_chw
 
   archive_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -395,7 +456,12 @@ def compress_videos(
   print(f"Archive: {archive_zip} ({archive_zip.stat().st_size:,} bytes)", flush=True)
 
 
-def _decode_and_restore_to_raw(src: Path, dst: Path, filt: LinearFilter | None) -> int:
+def _decode_and_restore_to_raw(
+  src: Path,
+  dst: Path,
+  even_filt: LinearFilter | None,
+  odd_filt: LinearFilter | None,
+) -> int:
   target_w, target_h = camera_size
   fmt = "hevc" if src.suffix == ".hevc" else None
   container = av.open(str(src), format=fmt)
@@ -408,6 +474,7 @@ def _decode_and_restore_to_raw(src: Path, dst: Path, filt: LinearFilter | None) 
       t = yuv420_to_rgb(frame)
       x = _bicubic_upsample(t, target_h, target_w)
 
+      filt = even_filt if (n % 2 == 0) else odd_filt
       if filt is not None:
         x = filt(x)
       else:
@@ -423,10 +490,18 @@ def _decode_and_restore_to_raw(src: Path, dst: Path, filt: LinearFilter | None) 
 
 def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str]) -> None:
   _reset_dir(output_dir)
+  bank_path = archive_dir / "linear_filter_bank.pt"
   filt_path = archive_dir / "linear_filter.pt"
-  filt = _load_filter(filt_path) if filt_path.exists() else None
-  if filt:
-    print(f"Loaded LinearFilter ({_count_params(filt)} params)", flush=True)
+  even_filt = odd_filt = None
+  if bank_path.exists():
+    even_filt, odd_filt = _load_filter_bank(bank_path)
+    print(
+      f"Loaded LinearFilter bank (even={_count_params(even_filt)} odd={_count_params(odd_filt)} params)",
+      flush=True,
+    )
+  elif filt_path.exists():
+    even_filt = odd_filt = _load_filter(filt_path)
+    print(f"Loaded LinearFilter ({_count_params(even_filt)} params)", flush=True)
 
   for rel in video_names:
     base = Path(rel).with_suffix("")
@@ -435,7 +510,7 @@ def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str])
     if not src.exists():
       raise FileNotFoundError(f"Missing encoded video in archive: {src}")
     print(f"Decoding + restoring {src} -> {dst}", flush=True)
-    n = _decode_and_restore_to_raw(src, dst, filt)
+    n = _decode_and_restore_to_raw(src, dst, even_filt, odd_filt)
     print(f"Saved {n} frames", flush=True)
 
 
