@@ -49,7 +49,8 @@ class LinearFilter(nn.Module):
       self.weight.copy_(1.85 * identity - 0.85 * unsharp_k)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
-    return F.conv2d(x, self.weight, padding=self.pad, groups=3)
+    x_padded = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode="reflect")
+    return F.conv2d(x_padded, self.weight, groups=3)
 
 
 def _count_params(model: nn.Module) -> int:
@@ -92,7 +93,8 @@ def _bicubic_upsample(t: torch.Tensor, target_h: int, target_w: int, inverse_gam
 
 def _apply_unsharp(x: torch.Tensor, strength: float = 0.85) -> torch.Tensor:
   kernel = UNSHARP_KERNEL.expand(3, 1, 9, 9)
-  blur = F.conv2d(x, kernel, padding=4, groups=3)
+  x_padded = F.pad(x, (4, 4, 4, 4), mode="reflect")
+  blur = F.conv2d(x_padded, kernel, groups=3)
   return (x + strength * (x - blur)).clamp(0, 255)
 
 

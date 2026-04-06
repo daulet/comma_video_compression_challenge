@@ -18,3 +18,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-05T16:35:08-07:00	0f7f42c	3.06966340	0.00652413	0.33937979	0.02300095	863582	improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 268-byte temporal MLP refiner using previous linear residual state
 2026-04-05T17:00:12-07:00	95b86bc	3.07393268	0.00651956	0.34111205	0.02300218	863628	not_improved	x265 slow scale=0.45 crf=30 gop=180 scenecut=0 with 314-byte temporal MLP refiner using previous linear residual state and hidden=5
 2026-04-05T23:07:45-07:00	0872473	2.04393707	0.00531994	0.09258243	0.02198981	825618	improved	port adjacent ROI+SVT-AV1 preset0 crf34 fg22 hqdn3d + learned 9x9 linear filter (zero-pad variant)
+2026-04-05T23:46:53-07:00	ff7ff61	2.02064091	0.00529792	0.08856764	0.02198981	825618	improved	sync adjacent reflect padding for ROI+SVT-AV1 preset0 crf34 fg22 hqdn3d + learned 9x9 linear filter
