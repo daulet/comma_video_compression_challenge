@@ -35,6 +35,7 @@ UNSHARP_KERNEL = torch.tensor([
 SCALE_FACTOR = 0.45
 CRF = 34
 GAMMA_BOOST = 1.0
+TRAIN_SEED = 2024
 TEMPORAL_LINEAR_FEATURES = 13
 TEMPORAL_LINEAR_SAMPLE_STRIDE = 24
 TEMPORAL_RIDGE = 1e-2
@@ -59,7 +60,7 @@ class TemporalRefiner:
 
 
 class LinearFilter(nn.Module):
-  def __init__(self, kernel_size: int = 9, init_strength: float = 0.40):
+  def __init__(self, kernel_size: int = 9, init_strength: float = 0.85):
     super().__init__()
     self.kernel_size = kernel_size
     self.pad = kernel_size // 2
@@ -153,9 +154,6 @@ def _train_filter_with_eval_loss(
   lr: float = 1e-3,
 ) -> LinearFilter:
   from modules import DistortionNet, posenet_sd_path, segnet_sd_path
-
-  random.seed(2024)
-  torch.manual_seed(2024)
 
   eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
   n_frames = len(original_frames)
@@ -254,9 +252,6 @@ def _train_temporal_gru(
   lr: float = 5e-4,
 ) -> TemporalGRU:
   from modules import DistortionNet, posenet_sd_path, segnet_sd_path
-
-  random.seed(2024)
-  torch.manual_seed(2024)
 
   eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
   n_frames = len(original_frames)
@@ -964,7 +959,7 @@ def _roi_preprocess_video(src: Path, dst: Path, denoise_strength: float = 2.5, b
 
 def _encode_one_video(src: Path, dst: Path, scale_factor: float, crf: int) -> None:
   dst.parent.mkdir(parents=True, exist_ok=True)
-  vf = f"scale=trunc(iw*{scale_factor}/2)*2:trunc(ih*{scale_factor}/2)*2:flags=lanczos"
+  vf = f"scale=trunc(iw*{scale_factor}/2)*2:trunc(ih*{scale_factor}/2)*2:flags=lanczos,hqdn3d=1.5:0:0:0"
 
   if SVTAV1_ENC.exists():
     import subprocess as sp
@@ -1039,6 +1034,9 @@ def compress_videos(
     compressed_frames = _decode_video_frames(dst)
     upsampled_chw = [_bicubic_upsample(f, target_h, target_w) for f in compressed_frames]
     print(f"  {len(compressed_frames)} frames", flush=True)
+
+    random.seed(TRAIN_SEED)
+    torch.manual_seed(TRAIN_SEED)
 
     print("Training LinearFilter with eval model loss...", flush=True)
     filt = _train_filter_with_eval_loss(original_frames, upsampled_chw)

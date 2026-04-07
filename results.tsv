@@ -23,3 +23,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-06T20:18:04-07:00	68d3db6	2.23322814	0.00573770	0.12306111	0.02200515	826194	not_improved	ROI+SVT-AV1 reflect-pad filter bank plus 268-byte temporal refiner
 2026-04-06T20:41:15-07:00	ade698f	2.29186675	0.00528553	0.14709532	0.02201942	826730	not_improved	ROI+SVT-AV1 reflect-pad gated edge-vs-smooth parity filter bank
 2026-04-06T21:20:43-07:00	2294483	2.03703196	0.00536066	0.08757497	0.02260604	848755	not_improved	port adjacent single 9x9 LinearFilter plus TemporalGRU seed=2024 with ROI+SVT-AV1 preset0 crf34 fg22 no-hqdn3d
+2026-04-06T21:57:16-07:00	d1c6a1e	2.02131034	0.00532576	0.08741159	0.02215172	831697	not_improved	revert to exact adjacent hqdn3d plus strong 9x9 init and single-seed stream for TemporalGRU
