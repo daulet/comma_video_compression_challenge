@@ -100,3 +100,41 @@ Loop indefinitely until manually interrupted:
 7. Repeat.
 
 The first experiment should be an unchanged baseline run of current `compress.py`.
+
+## Current Frontier
+
+As of 2026-04-07, the main useful exploratory result outside the official `compress.py` loop is:
+
+- For the partial objective `100 * segnet_dist + 25 * rate` while intentionally ignoring PoseNet, the best found pocket is:
+  - render source: low-res semantic overlay
+  - `source_mode=overlay`
+  - `alpha=0.99`
+  - downscale the SegNet-preprocessed frame (`512x384`) to about `256x192` (`0.5x`)
+  - store with lossy `webp`
+  - `quality=75`
+  - restore with `lanczos`
+  - inflate to camera resolution with `bilinear`
+- On the full clip, that configuration gave:
+  - `segnet_dist = 0.01067296`
+  - `rate = 0.02392383`
+  - `100 * segnet_dist + 25 * rate = 1.66539217`
+
+Nearby findings:
+
+- Plain `orig_low` is very close, but slightly worse than the `overlay alpha=0.99` variant in the same `0.5x` / `webp q=75` regime.
+- Pure palette / SegNet-visualization candidates are not competitive on `segnet + rate`; they compress well but hurt SegNet too much.
+- The useful scale region is around `0.5x` semantic resolution. Larger scales waste bytes; smaller scales save bytes but SegNet rises too fast.
+- For this partial objective, pushing `webp` quality below about `75` on the full clip was worse overall even though bytes dropped.
+
+## Next Phase
+
+The next meaningful search phase should focus on PoseNet, not on further SegNet-only work.
+
+Practical guidance:
+
+1. Treat the `0.5x` semantic overlay / `webp q=75` regime as the current SegNet-rate anchor.
+2. When testing PoseNet ideas, try to keep the odd-frame SegNet path near that anchor instead of reopening broad SegNet-only searches.
+3. Use the fact that SegNet is only scored on the odd frames in the evaluator pairing; spend new modeling effort on temporal handling and the frame content that matters to PoseNet.
+4. Do not spend more time on pure palette-video candidates unless there is a new mechanism for recovering PoseNet.
+
+Exploratory helpers used for this phase are not part of the official experiment loop unless explicitly promoted into `compress.py`.
