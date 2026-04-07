@@ -21,3 +21,4 @@ timestamp	commit	score	segnet_dist	posenet_dist	rate	archive_bytes	status	descri
 2026-04-05T23:46:53-07:00	ff7ff61	2.02064091	0.00529792	0.08856764	0.02198981	825618	improved	sync adjacent reflect padding for ROI+SVT-AV1 preset0 crf34 fg22 hqdn3d + learned 9x9 linear filter
 2026-04-06T08:58:19-07:00	612daba	2.08321851	0.00530471	0.10057508	0.02199505	825815	not_improved	parity-specific 9x9 linear filter bank with evaluator-aligned pair training and odd-frame SegNet argmax-margin loss
 2026-04-06T20:18:04-07:00	68d3db6	2.23322814	0.00573770	0.12306111	0.02200515	826194	not_improved	ROI+SVT-AV1 reflect-pad filter bank plus 268-byte temporal refiner
+2026-04-06T20:41:15-07:00	ade698f	2.29186675	0.00528553	0.14709532	0.02201942	826730	not_improved	ROI+SVT-AV1 reflect-pad gated edge-vs-smooth parity filter bank

@@ -59,7 +59,7 @@ class TemporalRefiner:
 
 
 class LinearFilter(nn.Module):
-  def __init__(self, kernel_size: int = 9):
+  def __init__(self, kernel_size: int = 9, init_strength: float = 0.85):
     super().__init__()
     self.kernel_size = kernel_size
     self.pad = kernel_size // 2
@@ -69,7 +69,7 @@ class LinearFilter(nn.Module):
       unsharp_k = UNSHARP_KERNEL.unsqueeze(0).expand(3, 1, 9, 9)
       identity = torch.zeros(3, 1, 9, 9)
       identity[:, :, 4, 4] = 1.0
-      self.weight.copy_(1.85 * identity - 0.85 * unsharp_k)
+      self.weight.copy_((1.0 + init_strength) * identity - init_strength * unsharp_k)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     x_padded = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode="reflect")
@@ -121,6 +121,32 @@ def _apply_unsharp(x: torch.Tensor, strength: float = 0.85) -> torch.Tensor:
   return (x + strength * (x - blur)).clamp(0, 255)
 
 
+def _edge_gate_features(x: torch.Tensor) -> torch.Tensor:
+  y = 0.299 * x[:, 0:1] + 0.587 * x[:, 1:2] + 0.114 * x[:, 2:3]
+  blur = F.avg_pool2d(F.pad(y, (1, 1, 1, 1), mode="reflect"), kernel_size=3, stride=1)
+  edge = (y - blur).abs()
+  edge = F.avg_pool2d(F.pad(edge, (1, 1, 1, 1), mode="reflect"), kernel_size=3, stride=1)
+  scale = edge.mean(dim=(2, 3), keepdim=True).clamp_min(1e-3)
+  return edge / scale
+
+
+def _edge_gate_map(x: torch.Tensor, gate_scale: torch.Tensor, gate_bias: torch.Tensor) -> torch.Tensor:
+  return torch.sigmoid(gate_scale.view(1, 1, 1, 1) * (_edge_gate_features(x) - gate_bias.view(1, 1, 1, 1)))
+
+
+def _apply_gated_filters(
+  x: torch.Tensor,
+  smooth_filt: LinearFilter,
+  detail_filt: LinearFilter,
+  gate_scale: torch.Tensor,
+  gate_bias: torch.Tensor,
+) -> torch.Tensor:
+  gate = _edge_gate_map(x, gate_scale, gate_bias)
+  smooth = smooth_filt(x)
+  detail = detail_filt(x)
+  return smooth + gate * (detail - smooth)
+
+
 def _boundary_priority_map(classes: torch.Tensor) -> torch.Tensor:
   boundary = torch.zeros_like(classes, dtype=torch.bool)
   boundary[:, 1:, :] |= classes[:, 1:, :] != classes[:, :-1, :]
@@ -149,7 +175,7 @@ def _train_filter_bank_with_eval_loss(
   n_iters: int = 300,
   batch_size: int = 2,
   lr: float = 1e-3,
-) -> tuple[LinearFilter, LinearFilter]:
+) -> tuple[LinearFilter, LinearFilter, LinearFilter, LinearFilter, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   from modules import DistortionNet, posenet_sd_path, segnet_sd_path
 
   eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
@@ -187,20 +213,38 @@ def _train_filter_bank_with_eval_loss(
       orig_seg_weights.append(_boundary_priority_map(classes.long()))
   print(f"  Pre-computed {len(orig_pose_targets)} evaluator pairs", flush=True)
 
-  even_filt = LinearFilter(kernel_size=9)
-  odd_filt = LinearFilter(kernel_size=9)
+  even_smooth = LinearFilter(kernel_size=9, init_strength=0.15)
+  even_detail = LinearFilter(kernel_size=9, init_strength=0.95)
+  odd_smooth = LinearFilter(kernel_size=9, init_strength=0.15)
+  odd_detail = LinearFilter(kernel_size=9, init_strength=0.95)
+  even_gate_scale = nn.Parameter(torch.tensor(2.0))
+  even_gate_bias = nn.Parameter(torch.tensor(1.5))
+  odd_gate_scale = nn.Parameter(torch.tensor(2.0))
+  odd_gate_bias = nn.Parameter(torch.tensor(1.5))
   print(
-    f"  LinearFilter bank: even={_count_params(even_filt)} odd={_count_params(odd_filt)} params",
+    (
+      "  Gated LinearFilter bank: "
+      f"even=({_count_params(even_smooth)}+{_count_params(even_detail)}) "
+      f"odd=({_count_params(odd_smooth)}+{_count_params(odd_detail)}) params"
+    ),
     flush=True,
   )
   optimizer = torch.optim.Adam(
-    list(even_filt.parameters()) + list(odd_filt.parameters()),
+    (
+      list(even_smooth.parameters())
+      + list(even_detail.parameters())
+      + list(odd_smooth.parameters())
+      + list(odd_detail.parameters())
+      + [even_gate_scale, even_gate_bias, odd_gate_scale, odd_gate_bias]
+    ),
     lr=lr,
   )
   scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
 
-  even_filt.train()
-  odd_filt.train()
+  even_smooth.train()
+  even_detail.train()
+  odd_smooth.train()
+  odd_detail.train()
   running_loss = 0.0
   running_pose = 0.0
   running_seg = 0.0
@@ -215,8 +259,8 @@ def _train_filter_bank_with_eval_loss(
 
     for pair_idx in pair_indices:
       i = pair_idx * 2
-      f_i = even_filt(upsampled_eval[i])
-      f_i1 = odd_filt(upsampled_eval[i + 1])
+      f_i = _apply_gated_filters(upsampled_eval[i], even_smooth, even_detail, even_gate_scale, even_gate_bias)
+      f_i1 = _apply_gated_filters(upsampled_eval[i + 1], odd_smooth, odd_detail, odd_gate_scale, odd_gate_bias)
 
       pair = torch.stack([
         f_i.squeeze(0).permute(1, 2, 0),
@@ -257,9 +301,20 @@ def _train_filter_bank_with_eval_loss(
       )
       running_loss = running_pose = running_seg = 0.0
 
-  even_filt.eval()
-  odd_filt.eval()
-  return even_filt, odd_filt
+  even_smooth.eval()
+  even_detail.eval()
+  odd_smooth.eval()
+  odd_detail.eval()
+  return (
+    even_smooth,
+    even_detail,
+    odd_smooth,
+    odd_detail,
+    even_gate_scale.detach(),
+    even_gate_bias.detach(),
+    odd_gate_scale.detach(),
+    odd_gate_bias.detach(),
+  )
 
 
 def _save_filter(filt: LinearFilter, path: Path) -> int:
@@ -282,29 +337,80 @@ def _load_filter(path: Path) -> LinearFilter:
   return filt
 
 
-def _save_filter_bank(even_filt: LinearFilter, odd_filt: LinearFilter, path: Path) -> int:
+def _save_filter_bank(
+  even_smooth: LinearFilter,
+  even_detail: LinearFilter,
+  odd_smooth: LinearFilter,
+  odd_detail: LinearFilter,
+  even_gate_scale: torch.Tensor,
+  even_gate_bias: torch.Tensor,
+  odd_gate_scale: torch.Tensor,
+  odd_gate_bias: torch.Tensor,
+  path: Path,
+) -> int:
   state = {
-    "even": {k: v.half() for k, v in even_filt.state_dict().items()},
-    "odd": {k: v.half() for k, v in odd_filt.state_dict().items()},
+    "even_smooth": {k: v.half() for k, v in even_smooth.state_dict().items()},
+    "even_detail": {k: v.half() for k, v in even_detail.state_dict().items()},
+    "odd_smooth": {k: v.half() for k, v in odd_smooth.state_dict().items()},
+    "odd_detail": {k: v.half() for k, v in odd_detail.state_dict().items()},
+    "gate": {
+      "even_scale": even_gate_scale.half(),
+      "even_bias": even_gate_bias.half(),
+      "odd_scale": odd_gate_scale.half(),
+      "odd_bias": odd_gate_bias.half(),
+    },
   }
   buf = io.BytesIO()
   torch.save(state, buf)
   data = buf.getvalue()
   path.parent.mkdir(parents=True, exist_ok=True)
   path.write_bytes(data)
-  print(f"Saved LinearFilter bank: {len(data)} bytes", flush=True)
+  print(f"Saved gated LinearFilter bank: {len(data)} bytes", flush=True)
   return len(data)
 
 
-def _load_filter_bank(path: Path) -> tuple[LinearFilter, LinearFilter]:
+def _load_filter_bank(path: Path) -> tuple[LinearFilter, LinearFilter, LinearFilter, LinearFilter, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   state = torch.load(path, map_location="cpu", weights_only=True)
-  even_filt = LinearFilter(kernel_size=9)
-  odd_filt = LinearFilter(kernel_size=9)
-  even_filt.load_state_dict({k: v.float() for k, v in state["even"].items()})
-  odd_filt.load_state_dict({k: v.float() for k, v in state["odd"].items()})
-  even_filt.eval()
-  odd_filt.eval()
-  return even_filt, odd_filt
+  if "even" in state and "odd" in state:
+    even_filt = LinearFilter(kernel_size=9)
+    odd_filt = LinearFilter(kernel_size=9)
+    even_filt.load_state_dict({k: v.float() for k, v in state["even"].items()})
+    odd_filt.load_state_dict({k: v.float() for k, v in state["odd"].items()})
+    even_filt.eval()
+    odd_filt.eval()
+    return (
+      even_filt,
+      even_filt,
+      odd_filt,
+      odd_filt,
+      torch.tensor(16.0),
+      torch.tensor(-8.0),
+      torch.tensor(16.0),
+      torch.tensor(-8.0),
+    )
+  even_smooth = LinearFilter(kernel_size=9)
+  even_detail = LinearFilter(kernel_size=9)
+  odd_smooth = LinearFilter(kernel_size=9)
+  odd_detail = LinearFilter(kernel_size=9)
+  even_smooth.load_state_dict({k: v.float() for k, v in state["even_smooth"].items()})
+  even_detail.load_state_dict({k: v.float() for k, v in state["even_detail"].items()})
+  odd_smooth.load_state_dict({k: v.float() for k, v in state["odd_smooth"].items()})
+  odd_detail.load_state_dict({k: v.float() for k, v in state["odd_detail"].items()})
+  even_smooth.eval()
+  even_detail.eval()
+  odd_smooth.eval()
+  odd_detail.eval()
+  gate = state["gate"]
+  return (
+    even_smooth,
+    even_detail,
+    odd_smooth,
+    odd_detail,
+    gate["even_scale"].float(),
+    gate["even_bias"].float(),
+    gate["odd_scale"].float(),
+    gate["odd_bias"].float(),
+  )
 
 
 def _refiner_path(dst_video: Path) -> Path:
@@ -690,11 +796,28 @@ def compress_videos(
     print(f"  {len(compressed_frames)} frames", flush=True)
 
     print("Training parity-specific LinearFilter bank with eval model loss...", flush=True)
-    even_filt, odd_filt = _train_filter_bank_with_eval_loss(original_frames, upsampled_chw)
+    (
+      even_smooth,
+      even_detail,
+      odd_smooth,
+      odd_detail,
+      even_gate_scale,
+      even_gate_bias,
+      odd_gate_scale,
+      odd_gate_bias,
+    ) = _train_filter_bank_with_eval_loss(original_frames, upsampled_chw)
 
-    _save_filter_bank(even_filt, odd_filt, archive_dir / "linear_filter_bank.pt")
-    print("Fitting tiny temporal refiner on top of filter bank...", flush=True)
-    _fit_temporal_refiner(original_frames, upsampled_chw, even_filt, odd_filt, _refiner_path(dst))
+    _save_filter_bank(
+      even_smooth,
+      even_detail,
+      odd_smooth,
+      odd_detail,
+      even_gate_scale,
+      even_gate_bias,
+      odd_gate_scale,
+      odd_gate_bias,
+      archive_dir / "linear_filter_bank.pt",
+    )
     del original_frames, compressed_frames, upsampled_chw
 
   archive_zip.parent.mkdir(parents=True, exist_ok=True)
@@ -710,8 +833,14 @@ def compress_videos(
 def _decode_and_restore_to_raw(
   src: Path,
   dst: Path,
-  even_filt: LinearFilter | None,
-  odd_filt: LinearFilter | None,
+  even_smooth: LinearFilter | None,
+  even_detail: LinearFilter | None,
+  odd_smooth: LinearFilter | None,
+  odd_detail: LinearFilter | None,
+  even_gate_scale: torch.Tensor | None,
+  even_gate_bias: torch.Tensor | None,
+  odd_gate_scale: torch.Tensor | None,
+  odd_gate_bias: torch.Tensor | None,
   refiner: TemporalRefiner | None,
 ) -> int:
   target_w, target_h = camera_size
@@ -729,9 +858,10 @@ def _decode_and_restore_to_raw(
       t = yuv420_to_rgb(frame)
       x = _bicubic_upsample(t, target_h, target_w)
 
-      filt = even_filt if (n % 2 == 0) else odd_filt
-      if filt is not None:
-        x = filt(x)
+      if (n % 2 == 0) and even_smooth is not None and even_detail is not None and even_gate_scale is not None and even_gate_bias is not None:
+        x = _apply_gated_filters(x, even_smooth, even_detail, even_gate_scale, even_gate_bias)
+      elif (n % 2 == 1) and odd_smooth is not None and odd_detail is not None and odd_gate_scale is not None and odd_gate_bias is not None:
+        x = _apply_gated_filters(x, odd_smooth, odd_detail, odd_gate_scale, odd_gate_bias)
       else:
         x = _apply_unsharp(x)
 
@@ -758,16 +888,32 @@ def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str])
   _reset_dir(output_dir)
   bank_path = archive_dir / "linear_filter_bank.pt"
   filt_path = archive_dir / "linear_filter.pt"
-  even_filt = odd_filt = None
+  even_smooth = even_detail = odd_smooth = odd_detail = None
+  even_gate_scale = even_gate_bias = odd_gate_scale = odd_gate_bias = None
   if bank_path.exists():
-    even_filt, odd_filt = _load_filter_bank(bank_path)
+    (
+      even_smooth,
+      even_detail,
+      odd_smooth,
+      odd_detail,
+      even_gate_scale,
+      even_gate_bias,
+      odd_gate_scale,
+      odd_gate_bias,
+    ) = _load_filter_bank(bank_path)
     print(
-      f"Loaded LinearFilter bank (even={_count_params(even_filt)} odd={_count_params(odd_filt)} params)",
+      (
+        "Loaded gated LinearFilter bank "
+        f"(even={_count_params(even_smooth)}+{_count_params(even_detail)} "
+        f"odd={_count_params(odd_smooth)}+{_count_params(odd_detail)} params)"
+      ),
       flush=True,
     )
   elif filt_path.exists():
-    even_filt = odd_filt = _load_filter(filt_path)
-    print(f"Loaded LinearFilter ({_count_params(even_filt)} params)", flush=True)
+    even_smooth = even_detail = odd_smooth = odd_detail = _load_filter(filt_path)
+    even_gate_scale = odd_gate_scale = torch.tensor(16.0)
+    even_gate_bias = odd_gate_bias = torch.tensor(-8.0)
+    print(f"Loaded LinearFilter ({_count_params(even_smooth)} params)", flush=True)
 
   for rel in video_names:
     base = Path(rel).with_suffix("")
@@ -779,7 +925,19 @@ def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str])
     if refiner is not None:
       print("Loaded temporal refiner", flush=True)
     print(f"Decoding + restoring {src} -> {dst}", flush=True)
-    n = _decode_and_restore_to_raw(src, dst, even_filt, odd_filt, refiner)
+    n = _decode_and_restore_to_raw(
+      src,
+      dst,
+      even_smooth,
+      even_detail,
+      odd_smooth,
+      odd_detail,
+      even_gate_scale,
+      even_gate_bias,
+      odd_gate_scale,
+      odd_gate_bias,
+      refiner,
+    )
     print(f"Saved {n} frames", flush=True)
 
 
