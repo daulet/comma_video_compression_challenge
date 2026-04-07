@@ -59,7 +59,7 @@ class TemporalRefiner:
 
 
 class LinearFilter(nn.Module):
-  def __init__(self, kernel_size: int = 9, init_strength: float = 0.85):
+  def __init__(self, kernel_size: int = 9, init_strength: float = 0.40):
     super().__init__()
     self.kernel_size = kernel_size
     self.pad = kernel_size // 2
@@ -74,6 +74,30 @@ class LinearFilter(nn.Module):
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     x_padded = F.pad(x, (self.pad, self.pad, self.pad, self.pad), mode="reflect")
     return F.conv2d(x_padded, self.weight, groups=3)
+
+
+class TemporalGRU(nn.Module):
+  def __init__(self, hidden_ch: int = 8, k: int = 3):
+    super().__init__()
+    self.hidden_ch = hidden_ch
+    p = k // 2
+    in_ch = 3 + hidden_ch
+    self.conv_z = nn.Conv2d(in_ch, hidden_ch, k, padding=p)
+    self.conv_r = nn.Conv2d(in_ch, hidden_ch, k, padding=p)
+    self.conv_h = nn.Conv2d(in_ch, hidden_ch, k, padding=p)
+    self.conv_out = nn.Conv2d(hidden_ch, 3, k, padding=p)
+
+  def forward_step(self, x: torch.Tensor, h: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    xh = torch.cat([x, h], dim=1)
+    z = torch.sigmoid(self.conv_z(xh))
+    r = torch.sigmoid(self.conv_r(xh))
+    xrh = torch.cat([x, r * h], dim=1)
+    h_new = (1 - z) * h + z * torch.tanh(self.conv_h(xrh))
+    residual = self.conv_out(h_new)
+    return x + residual, h_new
+
+  def init_hidden(self, h: int, w: int, device: str = "cpu") -> torch.Tensor:
+    return torch.zeros(1, self.hidden_ch, h, w, device=device)
 
 
 def _count_params(model: nn.Module) -> int:
@@ -119,6 +143,206 @@ def _apply_unsharp(x: torch.Tensor, strength: float = 0.85) -> torch.Tensor:
   x_padded = F.pad(x, (4, 4, 4, 4), mode="reflect")
   blur = F.conv2d(x_padded, kernel, groups=3)
   return (x + strength * (x - blur)).clamp(0, 255)
+
+
+def _train_filter_with_eval_loss(
+  original_frames: list[torch.Tensor],
+  upsampled_chw: list[torch.Tensor],
+  n_iters: int = 300,
+  batch_size: int = 2,
+  lr: float = 1e-3,
+) -> LinearFilter:
+  from modules import DistortionNet, posenet_sd_path, segnet_sd_path
+
+  random.seed(2024)
+  torch.manual_seed(2024)
+
+  eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
+  n_frames = len(original_frames)
+
+  print("  Loading eval models...", flush=True)
+  distortion_net = DistortionNet().eval()
+  distortion_net.load_state_dicts(posenet_sd_path, segnet_sd_path, "cpu")
+  for p in distortion_net.parameters():
+    p.requires_grad_(False)
+
+  print("  Preparing eval-resolution frames...", flush=True)
+  original_eval = []
+  upsampled_eval = []
+  for i in range(n_frames):
+    o = original_frames[i].permute(2, 0, 1).unsqueeze(0).float()
+    o = F.interpolate(o, size=(eval_h, eval_w), mode="bilinear", align_corners=False)
+    original_eval.append(o)
+    u = F.interpolate(upsampled_chw[i], size=(eval_h, eval_w), mode="bilinear", align_corners=False)
+    upsampled_eval.append(u)
+
+  print("  Pre-computing original eval outputs...", flush=True)
+  orig_posenet_outs = []
+  orig_segnet_outs = []
+  with torch.no_grad():
+    for i in range(n_frames - 1):
+      pair = torch.stack([
+        original_eval[i].squeeze(0).permute(1, 2, 0),
+        original_eval[i + 1].squeeze(0).permute(1, 2, 0),
+      ], dim=0).unsqueeze(0)
+      po, so = distortion_net(pair)
+      orig_posenet_outs.append({k: v.detach() for k, v in po.items()})
+      orig_segnet_outs.append(so.detach())
+  print(f"  Pre-computed {len(orig_posenet_outs)} pairs", flush=True)
+
+  filt = LinearFilter(kernel_size=9)
+  print(f"  LinearFilter: {_count_params(filt)} params (init from unsharp)", flush=True)
+  optimizer = torch.optim.Adam(filt.parameters(), lr=lr)
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
+
+  filt.train()
+  running_loss = 0.0
+  running_pose = 0.0
+  running_seg = 0.0
+
+  for it in range(n_iters):
+    pair_indices = [random.randint(0, n_frames - 2) for _ in range(batch_size)]
+    filtered_pairs = []
+    orig_pose_batch = []
+    orig_seg_batch = []
+
+    for i in pair_indices:
+      f_i = filt(upsampled_eval[i])
+      f_i1 = filt(upsampled_eval[i + 1])
+      pair = torch.stack([
+        f_i.squeeze(0).permute(1, 2, 0),
+        f_i1.squeeze(0).permute(1, 2, 0),
+      ], dim=0).unsqueeze(0)
+      filtered_pairs.append(pair)
+      orig_pose_batch.append(orig_posenet_outs[i])
+      orig_seg_batch.append(orig_segnet_outs[i])
+
+    filtered_batch = torch.cat(filtered_pairs, dim=0)
+    enh_po, enh_so = distortion_net(filtered_batch)
+    orig_pose = torch.cat([orig_pose_batch[j]["pose"] for j in range(batch_size)])
+    loss_posenet = F.mse_loss(enh_po["pose"][:, :6], orig_pose[:, :6])
+    orig_seg = torch.cat(orig_seg_batch)
+    orig_classes = orig_seg.argmax(dim=1)
+    loss_segnet = F.cross_entropy(enh_so, orig_classes)
+    loss = 10.0 * loss_posenet + 1.0 * loss_segnet
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    running_loss += loss.item()
+    running_pose += loss_posenet.item()
+    running_seg += loss_segnet.item()
+    if (it + 1) % 50 == 0:
+      n = 50
+      print(
+        f"  iter {it+1}/{n_iters}: loss={running_loss/n:.4f} pose={running_pose/n:.6f} seg={running_seg/n:.4f} lr={scheduler.get_last_lr()[0]:.6f}",
+        flush=True,
+      )
+      running_loss = running_pose = running_seg = 0.0
+
+  filt.eval()
+  return filt
+
+
+def _train_temporal_gru(
+  original_frames: list[torch.Tensor],
+  upsampled_chw: list[torch.Tensor],
+  n_iters: int = 200,
+  seq_len: int = 10,
+  lr: float = 5e-4,
+) -> TemporalGRU:
+  from modules import DistortionNet, posenet_sd_path, segnet_sd_path
+
+  random.seed(2024)
+  torch.manual_seed(2024)
+
+  eval_h, eval_w = segnet_model_input_size[1], segnet_model_input_size[0]
+  n_frames = len(original_frames)
+
+  print("  Loading eval models...", flush=True)
+  distortion_net = DistortionNet().eval()
+  distortion_net.load_state_dicts(posenet_sd_path, segnet_sd_path, "cpu")
+  for p in distortion_net.parameters():
+    p.requires_grad_(False)
+
+  print("  Preparing eval-resolution frames...", flush=True)
+  original_eval = []
+  upsampled_eval = []
+  for i in range(n_frames):
+    o = original_frames[i].permute(2, 0, 1).unsqueeze(0).float()
+    o = F.interpolate(o, size=(eval_h, eval_w), mode="bilinear", align_corners=False)
+    original_eval.append(o)
+    u = F.interpolate(upsampled_chw[i], size=(eval_h, eval_w), mode="bilinear", align_corners=False)
+    upsampled_eval.append(u)
+
+  print("  Pre-computing original eval outputs...", flush=True)
+  orig_posenet_outs = []
+  orig_segnet_outs = []
+  with torch.no_grad():
+    for i in range(n_frames - 1):
+      pair = torch.stack([
+        original_eval[i].squeeze(0).permute(1, 2, 0),
+        original_eval[i + 1].squeeze(0).permute(1, 2, 0),
+      ], dim=0).unsqueeze(0)
+      po, so = distortion_net(pair)
+      orig_posenet_outs.append({k: v.detach() for k, v in po.items()})
+      orig_segnet_outs.append(so.detach())
+  print(f"  Pre-computed {len(orig_posenet_outs)} pairs", flush=True)
+
+  gru = TemporalGRU(hidden_ch=8, k=3)
+  print(f"  TemporalGRU: {_count_params(gru)} params", flush=True)
+  optimizer = torch.optim.Adam(gru.parameters(), lr=lr)
+  scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=n_iters)
+
+  gru.train()
+  running_loss = 0.0
+  running_pose = 0.0
+  running_seg = 0.0
+
+  for it in range(n_iters):
+    start = random.randint(0, n_frames - seq_len - 1) // 2 * 2
+    h = gru.init_hidden(eval_h, eval_w)
+    enhanced_frames = []
+    for t in range(start, start + seq_len):
+      enh, h = gru.forward_step(upsampled_eval[t], h)
+      enhanced_frames.append(enh)
+
+    total_pose_loss = torch.tensor(0.0)
+    total_seg_loss = torch.tensor(0.0)
+    n_pairs = 0
+    for j in range(0, len(enhanced_frames) - 1, 2):
+      t = start + j
+      pair = torch.stack([
+        enhanced_frames[j].squeeze(0).permute(1, 2, 0),
+        enhanced_frames[j + 1].squeeze(0).permute(1, 2, 0),
+      ], dim=0).unsqueeze(0)
+      enh_po, enh_so = distortion_net(pair)
+      total_pose_loss = total_pose_loss + F.mse_loss(enh_po["pose"][:, :6], orig_posenet_outs[t]["pose"][:, :6])
+      total_seg_loss = total_seg_loss + F.cross_entropy(enh_so, orig_segnet_outs[t].argmax(dim=1))
+      n_pairs += 1
+
+    loss = (10.0 * total_pose_loss + 1.0 * total_seg_loss) / max(n_pairs, 1)
+
+    optimizer.zero_grad()
+    loss.backward()
+    optimizer.step()
+    scheduler.step()
+
+    running_loss += loss.item()
+    running_pose += (total_pose_loss / max(n_pairs, 1)).item()
+    running_seg += (total_seg_loss / max(n_pairs, 1)).item()
+    if (it + 1) % 25 == 0:
+      n = 25
+      print(
+        f"  iter {it+1}/{n_iters}: loss={running_loss/n:.4f} pose={running_pose/n:.6f} seg={running_seg/n:.4f} lr={scheduler.get_last_lr()[0]:.6f}",
+        flush=True,
+      )
+      running_loss = running_pose = running_seg = 0.0
+
+  gru.eval()
+  return gru
 
 
 def _edge_gate_features(x: torch.Tensor) -> torch.Tensor:
@@ -335,6 +559,27 @@ def _load_filter(path: Path) -> LinearFilter:
   filt.load_state_dict(state)
   filt.eval()
   return filt
+
+
+def _save_gru(gru: TemporalGRU, path: Path) -> int:
+  state = {k: v.half() for k, v in gru.state_dict().items()}
+  buf = io.BytesIO()
+  torch.save(state, buf)
+  data = buf.getvalue()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  path.write_bytes(data)
+  print(f"Saved TemporalGRU: {len(data)} bytes ({_count_params(gru)} params)", flush=True)
+  return len(data)
+
+
+def _load_gru(path: Path) -> TemporalGRU:
+  state = torch.load(path, map_location="cpu", weights_only=True)
+  state = {k: v.float() for k, v in state.items()}
+  hidden_ch = state["conv_out.weight"].shape[1]
+  gru = TemporalGRU(hidden_ch=hidden_ch, k=3)
+  gru.load_state_dict(state)
+  gru.eval()
+  return gru
 
 
 def _save_filter_bank(
@@ -719,7 +964,7 @@ def _roi_preprocess_video(src: Path, dst: Path, denoise_strength: float = 2.5, b
 
 def _encode_one_video(src: Path, dst: Path, scale_factor: float, crf: int) -> None:
   dst.parent.mkdir(parents=True, exist_ok=True)
-  vf = f"scale=trunc(iw*{scale_factor}/2)*2:trunc(ih*{scale_factor}/2)*2:flags=lanczos,hqdn3d=1.5:0:0:0"
+  vf = f"scale=trunc(iw*{scale_factor}/2)*2:trunc(ih*{scale_factor}/2)*2:flags=lanczos"
 
   if SVTAV1_ENC.exists():
     import subprocess as sp
@@ -795,30 +1040,19 @@ def compress_videos(
     upsampled_chw = [_bicubic_upsample(f, target_h, target_w) for f in compressed_frames]
     print(f"  {len(compressed_frames)} frames", flush=True)
 
-    print("Training parity-specific LinearFilter bank with eval model loss...", flush=True)
-    (
-      even_smooth,
-      even_detail,
-      odd_smooth,
-      odd_detail,
-      even_gate_scale,
-      even_gate_bias,
-      odd_gate_scale,
-      odd_gate_bias,
-    ) = _train_filter_bank_with_eval_loss(original_frames, upsampled_chw)
+    print("Training LinearFilter with eval model loss...", flush=True)
+    filt = _train_filter_with_eval_loss(original_frames, upsampled_chw)
+    _save_filter(filt, archive_dir / "linear_filter.pt")
 
-    _save_filter_bank(
-      even_smooth,
-      even_detail,
-      odd_smooth,
-      odd_detail,
-      even_gate_scale,
-      even_gate_bias,
-      odd_gate_scale,
-      odd_gate_bias,
-      archive_dir / "linear_filter_bank.pt",
-    )
-    del original_frames, compressed_frames, upsampled_chw
+    print("Applying linear filter for GRU training...", flush=True)
+    with torch.no_grad():
+      filtered_chw = [filt(u) for u in upsampled_chw]
+
+    print("Training TemporalGRU with eval model loss...", flush=True)
+    gru = _train_temporal_gru(original_frames, filtered_chw)
+    _save_gru(gru, archive_dir / "temporal_gru.pt")
+
+    del original_frames, compressed_frames, upsampled_chw, filtered_chw
 
   archive_zip.parent.mkdir(parents=True, exist_ok=True)
   if archive_zip.exists():
@@ -833,15 +1067,8 @@ def compress_videos(
 def _decode_and_restore_to_raw(
   src: Path,
   dst: Path,
-  even_smooth: LinearFilter | None,
-  even_detail: LinearFilter | None,
-  odd_smooth: LinearFilter | None,
-  odd_detail: LinearFilter | None,
-  even_gate_scale: torch.Tensor | None,
-  even_gate_bias: torch.Tensor | None,
-  odd_gate_scale: torch.Tensor | None,
-  odd_gate_bias: torch.Tensor | None,
-  refiner: TemporalRefiner | None,
+  filt: LinearFilter | None,
+  gru: TemporalGRU | None = None,
 ) -> int:
   target_w, target_h = camera_size
   fmt = "hevc" if src.suffix == ".hevc" else None
@@ -849,35 +1076,24 @@ def _decode_and_restore_to_raw(
   stream = container.streams.video[0]
   dst.parent.mkdir(parents=True, exist_ok=True)
 
+  gru_h = gru.init_hidden(target_h, target_w) if gru is not None else None
+
   n = 0
-  prev_base = None
-  prev_prev_base = None
-  prev_linear_residual = None
   with torch.inference_mode(), dst.open("wb") as f:
     for frame in container.decode(stream):
       t = yuv420_to_rgb(frame)
       x = _bicubic_upsample(t, target_h, target_w)
 
-      if (n % 2 == 0) and even_smooth is not None and even_detail is not None and even_gate_scale is not None and even_gate_bias is not None:
-        x = _apply_gated_filters(x, even_smooth, even_detail, even_gate_scale, even_gate_bias)
-      elif (n % 2 == 1) and odd_smooth is not None and odd_detail is not None and odd_gate_scale is not None and odd_gate_bias is not None:
-        x = _apply_gated_filters(x, odd_smooth, odd_detail, odd_gate_scale, odd_gate_bias)
+      if filt is not None:
+        x = filt(x)
       else:
         x = _apply_unsharp(x)
 
-      base = _normalize_frame(x)
-      if prev_base is None:
-        prev_base = base
-      if prev_prev_base is None:
-        prev_prev_base = prev_base
-      if prev_linear_residual is None:
-        prev_linear_residual = _zero_residual_like(base)
-      refined, linear_residual = _apply_temporal_refiner(base, prev_base, prev_prev_base, prev_linear_residual, refiner)
-      out = refined.mul(255.0).clamp_(0.0, 255.0).squeeze(0).permute(1, 2, 0).round().to(torch.uint8)
+      if gru is not None:
+        x, gru_h = gru.forward_step(x, gru_h)
+
+      out = x.clamp(0, 255).squeeze(0).permute(1, 2, 0).round().to(torch.uint8)
       f.write(out.contiguous().numpy().tobytes())
-      prev_prev_base = prev_base
-      prev_base = base
-      prev_linear_residual = linear_residual
       n += 1
 
   container.close()
@@ -886,34 +1102,15 @@ def _decode_and_restore_to_raw(
 
 def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str]) -> None:
   _reset_dir(output_dir)
-  bank_path = archive_dir / "linear_filter_bank.pt"
   filt_path = archive_dir / "linear_filter.pt"
-  even_smooth = even_detail = odd_smooth = odd_detail = None
-  even_gate_scale = even_gate_bias = odd_gate_scale = odd_gate_bias = None
-  if bank_path.exists():
-    (
-      even_smooth,
-      even_detail,
-      odd_smooth,
-      odd_detail,
-      even_gate_scale,
-      even_gate_bias,
-      odd_gate_scale,
-      odd_gate_bias,
-    ) = _load_filter_bank(bank_path)
-    print(
-      (
-        "Loaded gated LinearFilter bank "
-        f"(even={_count_params(even_smooth)}+{_count_params(even_detail)} "
-        f"odd={_count_params(odd_smooth)}+{_count_params(odd_detail)} params)"
-      ),
-      flush=True,
-    )
-  elif filt_path.exists():
-    even_smooth = even_detail = odd_smooth = odd_detail = _load_filter(filt_path)
-    even_gate_scale = odd_gate_scale = torch.tensor(16.0)
-    even_gate_bias = odd_gate_bias = torch.tensor(-8.0)
-    print(f"Loaded LinearFilter ({_count_params(even_smooth)} params)", flush=True)
+  filt = _load_filter(filt_path) if filt_path.exists() else None
+  if filt is not None:
+    print(f"Loaded LinearFilter ({_count_params(filt)} params)", flush=True)
+
+  gru_path = archive_dir / "temporal_gru.pt"
+  gru = _load_gru(gru_path) if gru_path.exists() else None
+  if gru is not None:
+    print(f"Loaded TemporalGRU ({_count_params(gru)} params)", flush=True)
 
   for rel in video_names:
     base = Path(rel).with_suffix("")
@@ -921,23 +1118,8 @@ def inflate_archive(archive_dir: Path, output_dir: Path, video_names: list[str])
     dst = output_dir / f"{base}.raw"
     if not src.exists():
       raise FileNotFoundError(f"Missing encoded video in archive: {src}")
-    refiner = _load_temporal_refiner(_refiner_path(src))
-    if refiner is not None:
-      print("Loaded temporal refiner", flush=True)
     print(f"Decoding + restoring {src} -> {dst}", flush=True)
-    n = _decode_and_restore_to_raw(
-      src,
-      dst,
-      even_smooth,
-      even_detail,
-      odd_smooth,
-      odd_detail,
-      even_gate_scale,
-      even_gate_bias,
-      odd_gate_scale,
-      odd_gate_bias,
-      refiner,
-    )
+    n = _decode_and_restore_to_raw(src, dst, filt, gru)
     print(f"Saved {n} frames", flush=True)
 
 
