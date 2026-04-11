@@ -10,13 +10,6 @@ VIDEO_NAMES_FILE="${PD}/public_test_video_names.txt"
 ARCHIVE_DIR="${HERE}/archive"
 JOBS="1"
 SKIP_ENCODE="0"
-SKIP_PREPROCESS="0"
-SCALE="0.45"
-CRF="33"
-PRESET="0"
-FILM_GRAIN="22"
-KEYINT="180"
-SCD="0"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -28,23 +21,9 @@ while [[ $# -gt 0 ]]; do
       VIDEO_NAMES_FILE="$2"; shift 2 ;;
     --skip-encode)
       SKIP_ENCODE="1"; shift ;;
-    --skip-preprocess)
-      SKIP_PREPROCESS="1"; shift ;;
-    --scale)
-      SCALE="$2"; shift 2 ;;
-    --crf)
-      CRF="$2"; shift 2 ;;
-    --preset)
-      PRESET="$2"; shift 2 ;;
-    --film-grain)
-      FILM_GRAIN="$2"; shift 2 ;;
-    --keyint)
-      KEYINT="$2"; shift 2 ;;
-    --scd)
-      SCD="$2"; shift 2 ;;
     *)
       echo "Unknown arg: $1" >&2
-      echo "Usage: $0 [--in-dir <dir>] [--jobs <n>] [--video-names-file <file>] [--skip-encode] [--skip-preprocess] [--scale <f>] [--crf <n>] [--preset <n>] [--film-grain <n>] [--keyint <n>] [--scd <0|1>]" >&2
+      echo "Usage: $0 [--in-dir <dir>] [--jobs <n>] [--video-names-file <file>] [--skip-encode]" >&2
       exit 2 ;;
   esac
 done
@@ -54,7 +33,7 @@ if [[ "$SKIP_ENCODE" == "0" ]]; then
   mkdir -p "$ARCHIVE_DIR"
   mkdir -p "$TMP_DIR"
 
-  export IN_DIR ARCHIVE_DIR PD SCALE CRF PRESET FILM_GRAIN KEYINT SCD SKIP_PREPROCESS
+  export IN_DIR ARCHIVE_DIR PD
 
   head -n "$(wc -l < "$VIDEO_NAMES_FILE")" "$VIDEO_NAMES_FILE" | xargs -P"$JOBS" -I{} bash -lc '
     rel="$1"
@@ -64,38 +43,32 @@ if [[ "$SKIP_ENCODE" == "0" ]]; then
     BASE="${rel%.*}"
     OUT="${ARCHIVE_DIR}/${BASE}.mkv"
     PRE_IN="'"${TMP_DIR}"'/${BASE}.pre.mkv"
-    ENCODE_IN="$IN"
 
     mkdir -p "$(dirname "$OUT")" "$(dirname "$PRE_IN")"
     echo "→ ${IN}  →  ${OUT}"
 
-    # Step 1: Optional ROI preprocess — denoise outside driving corridor
-    if [[ "$SKIP_PREPROCESS" != "1" ]]; then
-      rm -f "$PRE_IN"
-      python "'"${HERE}"'/preprocess.py" \
-        --input "$IN" \
-        --output "$PRE_IN" \
-        --outside-luma-denoise 2.5 \
-        --outside-chroma-mode medium \
-        --feather-radius 24 \
-        --outside-blend 0.50
-      ENCODE_IN="$PRE_IN"
-    fi
+    # Step 1: ROI preprocess — denoise outside driving corridor
+    rm -f "$PRE_IN"
+    python "'"${HERE}"'/preprocess.py" \
+      --input "$IN" \
+      --output "$PRE_IN" \
+      --outside-luma-denoise 2.5 \
+      --outside-chroma-mode medium \
+      --feather-radius 24 \
+      --outside-blend 0.50
 
     # Step 2: Downscale + AV1 encode
     FFMPEG="${PD}/ffmpeg-new"
     [ ! -x "$FFMPEG" ] && FFMPEG="ffmpeg"
     export LD_LIBRARY_PATH="${PD}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     "$FFMPEG" -nostdin -y -hide_banner -loglevel warning \
-      -r 20 -fflags +genpts -i "$ENCODE_IN" \
-      -vf "scale=trunc(iw*${SCALE}/2)*2:trunc(ih*${SCALE}/2)*2:flags=lanczos" \
-      -pix_fmt yuv420p -c:v libsvtav1 -preset "${PRESET}" -crf "${CRF}" \
-      -svtav1-params "film-grain=${FILM_GRAIN}:keyint=${KEYINT}:scd=${SCD}" \
+      -r 20 -fflags +genpts -i "$PRE_IN" \
+      -vf "scale=trunc(iw*0.45/2)*2:trunc(ih*0.45/2)*2:flags=lanczos" \
+      -pix_fmt yuv420p -c:v libsvtav1 -preset 0 -crf 33 \
+      -svtav1-params "film-grain=22:keyint=180:scd=0" \
       -r 20 "$OUT"
 
-    if [[ -f "$PRE_IN" ]]; then
-      rm -f "$PRE_IN"
-    fi
+    rm -f "$PRE_IN"
   ' _ {}
 else
   if [[ ! -d "$ARCHIVE_DIR" ]]; then
@@ -104,13 +77,11 @@ else
   fi
 fi
 
-# Keep only the highest-priority inference artifact in the archive.
-rm -f "${ARCHIVE_DIR}/ren_model.int8.bz2" "${ARCHIVE_DIR}/ren_model.pt.bz2" "${ARCHIVE_DIR}/ren_model.pt"
+# Add model artifacts when present.
 for model in ren_model.int8.bz2 ren_model.pt.bz2 ren_model.pt; do
   if [[ -f "${HERE}/${model}" ]]; then
     cp -f "${HERE}/${model}" "${ARCHIVE_DIR}/${model}"
     echo "Included model artifact: ${model}"
-    break
   fi
 done
 

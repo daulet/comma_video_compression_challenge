@@ -1,11 +1,32 @@
 #!/usr/bin/env python
 import os, io, bz2, struct, av, torch, numpy as np
+import torch.nn as nn
 from PIL import Image
 from frame_utils import camera_size, yuv420_to_rgb
-from submissions.neural_inflate.model import REN, infer_features_from_state_dict
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+
+class REN(nn.Module):
+    def __init__(self, features=32):
+        super().__init__()
+        self.down = nn.PixelUnshuffle(2)
+        self.body = nn.Sequential(
+            nn.Conv2d(12, features, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(features, features, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(features, features, 3, padding=1), nn.ReLU(inplace=True),
+            nn.Conv2d(features, 12, 3, padding=1),
+        )
+        self.up = nn.PixelShuffle(2)
+
+    def forward(self, x):
+        x_norm = x / 255.0
+        residual = self.up(self.body(self.down(x_norm)))
+        return (x_norm + residual).clamp(0, 1) * 255.0
+
+
 MODEL = None
 
 def _load_f16_bz2(path):
@@ -42,14 +63,13 @@ def get_model(archive_dir=None):
         candidates.append((os.path.join(d, 'ren_model.pt'), 'raw'))
     for path, fmt in candidates:
         if os.path.exists(path):
+            MODEL = REN(features=32).to(DEVICE).eval()
             if fmt == 'int8':
-                state_dict = _load_int8_bz2(path)
+                MODEL.load_state_dict(_load_int8_bz2(path))
             elif fmt == 'f16':
-                state_dict = _load_f16_bz2(path)
+                MODEL.load_state_dict(_load_f16_bz2(path))
             else:
-                state_dict = torch.load(path, map_location=DEVICE, weights_only=True)
-            MODEL = REN(features=infer_features_from_state_dict(state_dict)).to(DEVICE).eval()
-            MODEL.load_state_dict(state_dict)
+                MODEL.load_state_dict(torch.load(path, map_location=DEVICE, weights_only=True))
             return MODEL
     raise FileNotFoundError("ren_model not found")
 
@@ -60,9 +80,6 @@ def decode_and_resize_to_file(video_path: str, dst: str):
     container = av.open(video_path, format=fmt)
     stream = container.streams.video[0]
     n = 0
-    model = get_model(os.path.dirname(video_path))
-    prev_rgb = None
-    prev_state = None
     with open(dst, 'wb') as f:
         for frame in container.decode(stream):
             t = yuv420_to_rgb(frame)
@@ -72,12 +89,8 @@ def decode_and_resize_to_file(video_path: str, dst: str):
                 pil = pil.resize((target_w, target_h), Image.LANCZOS)
                 x = torch.from_numpy(np.array(pil)).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
                 with torch.no_grad():
-                    x, prev_state = model(x, prev_rgb=prev_rgb, prev_state=prev_state, return_state=True)
-                prev_rgb = x
+                    x = get_model(os.path.dirname(video_path))(x)
                 t = x.clamp(0, 255).squeeze(0).permute(1, 2, 0).round().cpu().to(torch.uint8)
-            else:
-                prev_rgb = t.permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
-                prev_state = None
             f.write(t.contiguous().numpy().tobytes())
             n += 1
     container.close()

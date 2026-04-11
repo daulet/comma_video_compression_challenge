@@ -19,6 +19,13 @@ MAX_FRAMES_PER_VIDEO="0"
 FRAME_STRIDE="1"
 VAL_RATIO="0.1"
 MIN_VAL_PAIRS="64"
+ENCODE_SCALE="0.45"
+ENCODE_CRF="33"
+ENCODE_PRESET="0"
+ENCODE_FILM_GRAIN="22"
+ENCODE_KEYINT="180"
+ENCODE_SCD="0"
+SKIP_PREPROCESS="0"
 
 usage() {
   cat <<EOF
@@ -39,6 +46,13 @@ Options:
   --frame-stride <n>            keep every n-th frame (default: ${FRAME_STRIDE})
   --val-ratio <f>               validation ratio (default: ${VAL_RATIO})
   --min-val-pairs <n>           minimum val pairs (default: ${MIN_VAL_PAIRS})
+  --encode-scale <f>            AV1 input scale factor (default: ${ENCODE_SCALE})
+  --encode-crf <n>              AV1 CRF (default: ${ENCODE_CRF})
+  --encode-preset <n>           AV1 preset (default: ${ENCODE_PRESET})
+  --encode-film-grain <n>       AV1 film-grain param (default: ${ENCODE_FILM_GRAIN})
+  --encode-keyint <n>           AV1 keyint (default: ${ENCODE_KEYINT})
+  --encode-scd <0|1>            AV1 scene-cut detection (default: ${ENCODE_SCD})
+  --skip-preprocess             skip ROI preprocess before AV1 encode
 EOF
 }
 
@@ -58,6 +72,13 @@ while [[ $# -gt 0 ]]; do
     --frame-stride) FRAME_STRIDE="$2"; shift 2 ;;
     --val-ratio) VAL_RATIO="$2"; shift 2 ;;
     --min-val-pairs) MIN_VAL_PAIRS="$2"; shift 2 ;;
+    --encode-scale) ENCODE_SCALE="$2"; shift 2 ;;
+    --encode-crf) ENCODE_CRF="$2"; shift 2 ;;
+    --encode-preset) ENCODE_PRESET="$2"; shift 2 ;;
+    --encode-film-grain) ENCODE_FILM_GRAIN="$2"; shift 2 ;;
+    --encode-keyint) ENCODE_KEYINT="$2"; shift 2 ;;
+    --encode-scd) ENCODE_SCD="$2"; shift 2 ;;
+    --skip-preprocess) SKIP_PREPROCESS="1"; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1" >&2; usage; exit 2 ;;
   esac
@@ -75,6 +96,7 @@ if [[ "$SYNC" == "1" ]]; then
   echo "Syncing local repo into pod ${NAMESPACE}/${POD}:${REMOTE_REPO} ..."
   tar \
     --exclude='.git' \
+    --exclude='.claude' \
     --exclude='.venv' \
     --exclude='__pycache__' \
     --exclude='tmp' \
@@ -93,12 +115,20 @@ cd "$REMOTE_REPO"
 
 uv sync --group cu130
 source .venv/bin/activate
+export PYTHONUNBUFFERED=1
 
 bash submissions/neural_inflate/compress.sh \
   --in-dir "$REMOTE_GT_DIR" \
-  --video-names-file "$REMOTE_VIDEO_NAMES"
+  --video-names-file "$REMOTE_VIDEO_NAMES" \
+  --scale "$ENCODE_SCALE" \
+  --crf "$ENCODE_CRF" \
+  --preset "$ENCODE_PRESET" \
+  --film-grain "$ENCODE_FILM_GRAIN" \
+  --keyint "$ENCODE_KEYINT" \
+  --scd "$ENCODE_SCD" \
+  $( [[ "$SKIP_PREPROCESS" == "1" ]] && echo --skip-preprocess )
 
-python -m submissions.neural_inflate.train_ren \
+python -u -m submissions.neural_inflate.train_ren \
   --gt-dir "$REMOTE_GT_DIR" \
   --compressed-dir "$REMOTE_REPO/submissions/neural_inflate/archive" \
   --video-names-file "$REMOTE_VIDEO_NAMES" \
@@ -109,9 +139,12 @@ python -m submissions.neural_inflate.train_ren \
   --frame-stride "$FRAME_STRIDE" \
   --val-ratio "$VAL_RATIO" \
   --min-val-pairs "$MIN_VAL_PAIRS" \
+  --checkpoint-path "$REMOTE_REPO/submissions/neural_inflate/ren_checkpoint.pt" \
+  --checkpoint-every 1 \
+  --resume \
   --save-path "$REMOTE_REPO/submissions/neural_inflate/ren_model.pt"
 
-python -m submissions.neural_inflate.pack_ren \
+python -u -m submissions.neural_inflate.pack_ren \
   --input "$REMOTE_REPO/submissions/neural_inflate/ren_model.pt" \
   --output-int8 "$REMOTE_REPO/submissions/neural_inflate/ren_model.int8.bz2" \
   --output-f16 "$REMOTE_REPO/submissions/neural_inflate/ren_model.pt.bz2" \
@@ -124,7 +157,6 @@ bash submissions/neural_inflate/compress.sh \
 
 bash evaluate.sh \
   --submission-dir "$REMOTE_REPO/submissions/neural_inflate" \
-  --uncompressed-dir "$REMOTE_GT_DIR" \
   --video-names-file "$REMOTE_VIDEO_NAMES" \
   --device cuda
 EOF

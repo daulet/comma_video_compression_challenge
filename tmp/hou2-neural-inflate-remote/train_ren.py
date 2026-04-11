@@ -31,9 +31,31 @@ if str(ROOT) not in sys.path:
 
 from frame_utils import camera_size, yuv420_to_rgb  # noqa: E402
 from modules import DistortionNet, posenet_sd_path, segnet_sd_path  # noqa: E402
-from submissions.neural_inflate.model import REN  # noqa: E402
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+class REN(nn.Module):
+  def __init__(self, features: int = 32):
+    super().__init__()
+    self.down = nn.PixelUnshuffle(2)
+    self.body = nn.Sequential(
+      nn.Conv2d(12, features, 3, padding=1),
+      nn.ReLU(inplace=True),
+      nn.Conv2d(features, features, 3, padding=1),
+      nn.ReLU(inplace=True),
+      nn.Conv2d(features, features, 3, padding=1),
+      nn.ReLU(inplace=True),
+      nn.Conv2d(features, 12, 3, padding=1),
+    )
+    self.up = nn.PixelShuffle(2)
+    nn.init.zeros_(self.body[-1].weight)
+    nn.init.zeros_(self.body[-1].bias)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    x_norm = x / 255.0
+    residual = self.up(self.body(self.down(x_norm)))
+    return (x_norm + residual).clamp(0, 1) * 255.0
 
 
 @dataclass
@@ -123,7 +145,8 @@ def compute_loss(
   w_seg: float,
   w_temp: float,
 ) -> tuple[torch.Tensor, float, float, float]:
-  inf_a, inf_b = model.forward_pair(comp_a, comp_b)
+  inf_a = model(comp_a)
+  inf_b = model(comp_b)
 
   pair_inf = torch.stack([inf_a.permute(0, 2, 3, 1), inf_b.permute(0, 2, 3, 1)], dim=1)
   pair_gt = torch.stack([gt_a.permute(0, 2, 3, 1), gt_b.permute(0, 2, 3, 1)], dim=1)
@@ -267,44 +290,6 @@ def _to_device(x: torch.Tensor, non_blocking: bool) -> torch.Tensor:
   return x.to(DEVICE, non_blocking=non_blocking)
 
 
-def _save_checkpoint(
-  checkpoint_path: Path,
-  epoch: int,
-  model: nn.Module,
-  optimizer: torch.optim.Optimizer,
-  scheduler: torch.optim.lr_scheduler._LRScheduler,
-  best_val: float,
-  w_seg: float,
-) -> None:
-  payload = {
-    "epoch": epoch,
-    "model_state_dict": model.state_dict(),
-    "optimizer_state_dict": optimizer.state_dict(),
-    "scheduler_state_dict": scheduler.state_dict(),
-    "best_val": best_val,
-    "w_seg": w_seg,
-  }
-  tmp_path = checkpoint_path.with_name(f"{checkpoint_path.name}.tmp")
-  torch.save(payload, tmp_path)
-  tmp_path.replace(checkpoint_path)
-
-
-def _load_checkpoint(
-  checkpoint_path: Path,
-  model: nn.Module,
-  optimizer: torch.optim.Optimizer,
-  scheduler: torch.optim.lr_scheduler._LRScheduler,
-) -> tuple[int, float, float]:
-  ckpt = torch.load(checkpoint_path, map_location=DEVICE)
-  model.load_state_dict(ckpt["model_state_dict"])
-  optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-  scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-  start_epoch = int(ckpt["epoch"]) + 1
-  best_val = float(ckpt.get("best_val", float("inf")))
-  w_seg = float(ckpt.get("w_seg", 0.1))
-  return start_epoch, best_val, w_seg
-
-
 def train(args: argparse.Namespace) -> None:
   print(f"Device: {DEVICE}")
   print(f"Torch: {torch.__version__}")
@@ -314,8 +299,6 @@ def train(args: argparse.Namespace) -> None:
   torch.manual_seed(args.seed)
   if DEVICE.type == "cuda":
     torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     torch.cuda.manual_seed_all(args.seed)
 
   stores = load_video_pairs(args)
@@ -378,64 +361,34 @@ def train(args: argparse.Namespace) -> None:
   )
 
   args.save_path.parent.mkdir(parents=True, exist_ok=True)
-  args.checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
-  start_epoch = 1
-  best_val = float("inf")
+  # Calibrate seg weight from identity behavior unless overridden.
+  ca, cb, ga, gb = train_ds[0]
+  ca = ca.unsqueeze(0).to(DEVICE)
+  cb = cb.unsqueeze(0).to(DEVICE)
+  ga = ga.unsqueeze(0).to(DEVICE)
+  gb = gb.unsqueeze(0).to(DEVICE)
+  model.train()
+  _, lp0, ls0, lt0 = compute_loss(model, posenet, segnet, ca, cb, ga, gb, 1.0, args.w_temp)
 
-  resumed = False
-  if args.resume:
-    if args.checkpoint_path.exists():
-      start_epoch, best_val, resumed_w_seg = _load_checkpoint(
-        args.checkpoint_path, model, optimizer, scheduler
-      )
-      resumed = True
-      print(
-        f"Resumed from checkpoint: {args.checkpoint_path} "
-        f"(next_epoch={start_epoch}, best_val={best_val:.6f})"
-      )
-      w_seg = args.w_seg if args.w_seg is not None else resumed_w_seg
+  w_seg = args.w_seg
+  if w_seg is None:
+    if ls0 <= 0:
+      w_seg = 0.1
     else:
-      print(f"--resume set but checkpoint not found: {args.checkpoint_path}; starting fresh.")
-      w_seg = args.w_seg
-  else:
-    w_seg = args.w_seg
+      w_seg = max(0.01, min(10.0, lp0 / ls0))
 
-  if not resumed:
-    # Calibrate seg weight from identity behavior unless overridden.
-    ca, cb, ga, gb = train_ds[0]
-    ca = ca.unsqueeze(0).to(DEVICE)
-    cb = cb.unsqueeze(0).to(DEVICE)
-    ga = ga.unsqueeze(0).to(DEVICE)
-    gb = gb.unsqueeze(0).to(DEVICE)
-    model.train()
-    _, lp0, ls0, lt0 = compute_loss(model, posenet, segnet, ca, cb, ga, gb, 1.0, args.w_temp)
-
-    if w_seg is None:
-      if ls0 <= 0:
-        w_seg = 0.1
-      else:
-        w_seg = max(0.01, min(10.0, lp0 / ls0))
-
-    print("Initial loss calibration:")
-    print(f"  pose={lp0:.6f} seg={ls0:.6f} temp={lt0:.6f}")
-    print(f"  weights: w_seg={w_seg:.4f}, w_temp={args.w_temp:.4f}")
-  else:
-    print(f"Resumed weights: w_seg={w_seg:.4f}, w_temp={args.w_temp:.4f}")
+  print("Initial loss calibration:")
+  print(f"  pose={lp0:.6f} seg={ls0:.6f} temp={lt0:.6f}")
+  print(f"  weights: w_seg={w_seg:.4f}, w_temp={args.w_temp:.4f}")
 
   if DEVICE.type == "cuda":
     torch.cuda.empty_cache()
 
-  if start_epoch > args.epochs:
-    print(
-      f"Checkpoint epoch exceeds target epochs: start_epoch={start_epoch}, "
-      f"target_epochs={args.epochs}. Nothing to do."
-    )
-    return
-
+  best_val = float("inf")
   print(f"\nTraining for {args.epochs} epochs (batch_size={args.batch_size})")
 
-  for epoch in range(start_epoch, args.epochs + 1):
+  for epoch in range(1, args.epochs + 1):
     model.train()
     train_loss = train_pose = train_seg = train_temp = 0.0
     n_batches = 0
@@ -531,20 +484,6 @@ def train(args: argparse.Namespace) -> None:
       f"lr={scheduler.get_last_lr()[0]:.2e}{marker}"
     )
 
-    if args.checkpoint_every > 0 and (
-      epoch % args.checkpoint_every == 0 or epoch == args.epochs
-    ):
-      _save_checkpoint(
-        checkpoint_path=args.checkpoint_path,
-        epoch=epoch,
-        model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
-        best_val=best_val,
-        w_seg=w_seg,
-      )
-      print(f"Checkpoint saved: {args.checkpoint_path} (epoch={epoch})")
-
   size_kb = args.save_path.stat().st_size / 1024
   print(f"\nBest val_loss: {best_val:.6f}")
   print(f"Saved model: {args.save_path} ({size_kb:.1f} KB)")
@@ -555,7 +494,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--epochs", type=int, default=60)
   parser.add_argument("--batch-size", type=int, default=1)
   parser.add_argument("--lr", type=float, default=5e-4)
-  parser.add_argument("--features", type=int, default=24)
+  parser.add_argument("--features", type=int, default=32)
   parser.add_argument("--num-workers", type=int, default=0)
   parser.add_argument("--seed", type=int, default=1234)
   parser.add_argument("--val-every", type=int, default=5)
@@ -563,9 +502,6 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument("--min-val-pairs", type=int, default=64)
   parser.add_argument("--w-seg", type=float, default=None)
   parser.add_argument("--w-temp", type=float, default=0.005)
-  parser.add_argument("--checkpoint-path", type=Path, default=HERE / "ren_checkpoint.pt")
-  parser.add_argument("--checkpoint-every", type=int, default=1)
-  parser.add_argument("--resume", action="store_true")
 
   parser.add_argument("--gt-dir", type=Path, default=ROOT / "videos")
   parser.add_argument("--compressed-dir", type=Path, default=HERE / "archive")
@@ -583,8 +519,6 @@ def parse_args() -> argparse.Namespace:
     raise ValueError("--frame-stride must be > 0")
   if not (0.0 <= args.val_ratio < 1.0):
     raise ValueError("--val-ratio must be in [0, 1)")
-  if args.checkpoint_every <= 0:
-    raise ValueError("--checkpoint-every must be > 0")
   return args
 
 
